@@ -6,6 +6,7 @@ via the qBittorrent Web API.
 """
 import pytest
 import hashlib
+from types import SimpleNamespace
 from unittest.mock import Mock, patch, MagicMock, PropertyMock
 from typing import Dict, Any
 
@@ -320,6 +321,21 @@ class TestTestConnection:
 
 class TestAddTorrent:
     """Test adding torrents"""
+
+    @pytest.mark.parametrize("success_count,added_ids,accepted", [
+        (1, [], True),
+        (0, ["abcdef1234567890abcdef1234567890abcdef12"], True),
+        (0, [], False),
+        (0, ["0000000000000000000000000000000000000000"], False),
+    ])
+    def test_add_torrent_structured_response(self, mock_qb_client, success_count, added_ids, accepted):
+        expected_hash = "abcdef1234567890abcdef1234567890abcdef12"
+        mock_qb_client.client.torrents_add.return_value = SimpleNamespace(
+            success_count=success_count, added_torrent_ids=added_ids
+        )
+        mock_qb_client.client.torrents_info.return_value = [Mock(hash=expected_hash)]
+        result = mock_qb_client.add_torrent(magnet=f"magnet:?xt=urn:btih:{expected_hash}")
+        assert result == (expected_hash if accepted else None)
 
     def test_add_torrent_by_url_downloads_file_first(self, mock_qb_client, sample_torrent_bytes):
         """Test that URL downloads fetch the torrent file first to extract hash"""
@@ -1070,3 +1086,33 @@ class TestAddTorrentWithPrecomputedHash:
 
         # Should still return hash (optimistic like Readarr)
         assert info_hash == expected_hash
+
+
+
+def test_structured_add_retains_task_tracking_through_completion(mock_qb_client):
+    from threading import Event
+    from qbittorrentapi import torrents
+    from app.downloads.handlers.torrent import TorrentHandler
+    from app.models import DownloadTask
+
+    info_hash = "abcdef1234567890abcdef1234567890abcdef12"
+    metadata = {"success_count": 1, "added_torrent_ids": [info_hash]}
+    # Exercise the native response when running with the container's newer API
+    # library, while retaining compatibility with the locked test dependency.
+    response_type = getattr(torrents, "TorrentsAddedMetadata", None)
+    response = response_type(metadata) if response_type else SimpleNamespace(**metadata)
+    mock_qb_client.client.torrents_add.return_value = response
+    mock_qb_client.client.torrents_info.return_value = [Mock(hash=info_hash)]
+    mock_qb_client.client.torrents_categories.return_value = {}
+    task = DownloadTask(id=1, book_id=1, format="ebook", source="manual", protocol="torrent",
+        release_data_json="{}", download_url=f"magnet:?xt=urn:btih:{info_hash}")
+    db = Mock()
+    db.query.return_value.filter.return_value.first.return_value = None
+    handler = TorrentHandler(db_session=db)
+    with patch.object(handler, "_get_client", return_value=mock_qb_client), patch.object(
+        mock_qb_client, "get_download_status", return_value={"state": DownloadState.SEEDING, "progress": 100}
+    ), patch.object(mock_qb_client, "get_completed_download_path", return_value="/downloads/test.epub"):
+        result = handler.download(task, Event(), status_callback=lambda status: db.commit())
+    assert result == "/downloads/test.epub"
+    assert task.client_download_id == info_hash
+    assert task.client_type == "qbittorrent"

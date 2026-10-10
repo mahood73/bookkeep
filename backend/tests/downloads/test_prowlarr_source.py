@@ -731,3 +731,30 @@ class TestTitleMatches:
         # Only the correct title should survive
         assert len(results) == 1
         assert "Stephen King - It" in results[0].title
+
+
+class TestMagnetFallback:
+    """PR #94 regressions without discarding authenticated tracker URLs."""
+
+    @pytest.mark.parametrize("source_fields,expected", [
+        ({"magnetUrl": "magnet:?xt=urn:btih:abc&tr=tracker"}, "magnet:?xt=urn:btih:abc&tr=tracker"),
+        ({"infoHash": "a" * 40}, "magnet:?xt=urn:btih:" + "a" * 40 + "&dn=Test%20Book%20%5BEPUB%5D"),
+        ({"infoHash": "A" * 32}, "magnet:?xt=urn:btih:" + "A" * 32 + "&dn=Test%20Book%20%5BEPUB%5D"),
+        ({"infoHash": "invalid"}, None),
+        ({"infoHash": "a" * 40, "protocol": "usenet"}, None),
+    ])
+    def test_search_accepts_magnet_only_results(self, mock_prowlarr_source, source_fields, expected):
+        mock_prowlarr_source.client.search_with_retry.return_value = [{
+            "title": "Test Book [EPUB]", "protocol": "torrent", "seeders": 10,
+            **source_fields,
+        }]
+        releases = mock_prowlarr_source.search("Test Book")
+        assert [release.download_url for release in releases] == ([expected] if expected else [])
+
+    def test_existing_download_url_keeps_tracker_details(self, mock_prowlarr_source):
+        url = "https://tracker.example/download/1?passkey=test"
+        release = mock_prowlarr_source._convert_to_release({
+            "title": "Test Book [EPUB]", "protocol": "torrent", "downloadUrl": url,
+            "magnetUrl": "magnet:?xt=urn:btih:" + "a" * 40, "infoHash": "a" * 40,
+        }, "ebook")
+        assert release.download_url == url

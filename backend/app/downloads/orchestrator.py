@@ -24,6 +24,7 @@ from . import (
 )
 from ..models import Book, DownloadTask, AppSettings, DownloadClient, DirectDownloadSettings
 from ..database import SessionLocal
+from .prowlarr.utils import AUDIOBOOK_FORMATS, EBOOK_FORMATS
 
 logger = structlog.get_logger()
 
@@ -375,8 +376,17 @@ class DownloadOrchestrator:
                 # Success - copy/hardlink to destination
                 dest_path = self._copy_to_destination(task, download_path, db)
 
-                # Update task with final path (use dest_path if copy succeeded, otherwise source)
-                final_path = dest_path if dest_path else download_path
+                if dest_path is None:
+                    task.state = "error"
+                    task.message = task.import_message
+                    task.download_path = download_path
+                    db.commit()
+                    # Download succeeded: retain the torrent/files for inspection.
+                    # Failure cleanup would delete the original downloaded data.
+                    return
+
+                # Import succeeded, including downloads intentionally kept in place.
+                final_path = dest_path
 
                 task.state = "complete"
                 task.progress = 100.0
@@ -450,6 +460,29 @@ class DownloadOrchestrator:
         db.commit()
 
         try:
+            # Check actual files before copying or declaring availability, including
+            # downloads kept in place when no destination is configured.
+            source = Path(source_path)
+            if not source.exists():
+                task.import_status = 'failed'
+                task.import_message = f'Source file not found: {source_path}'
+                db.commit()
+                return None
+
+            supported_formats = {
+                "ebook": EBOOK_FORMATS,
+                "audiobook": AUDIOBOOK_FORMATS,
+            }.get(task.format, set())
+            files = (source,) if source.is_file() else source.rglob("*")
+            if not any(
+                file.is_file() and file.suffix.lower().lstrip(".") in supported_formats
+                for file in files
+            ):
+                task.import_status = 'failed'
+                task.import_message = f'No supported {task.format} files found in download; source retained.'
+                db.commit()
+                return None
+
             # Get configured destination path based on format
             setting_key = f"{task.format}_download_path"  # e.g., "ebook_download_path"
             setting = db.query(AppSettings).filter(AppSettings.key == setting_key).first()
@@ -473,20 +506,6 @@ class DownloadOrchestrator:
                 # Mark import as failed
                 task.import_status = 'failed'
                 task.import_message = f'Destination path does not exist: {dest_base}'
-                db.commit()
-                return None
-
-            # Determine source file/folder
-            source = Path(source_path)
-            if not source.exists():
-                logger.error(
-                    "orchestrator_source_not_found",
-                    task_id=task.id,
-                    source=source_path
-                )
-                # Mark import as failed
-                task.import_status = 'failed'
-                task.import_message = f'Source file not found: {source_path}'
                 db.commit()
                 return None
 
