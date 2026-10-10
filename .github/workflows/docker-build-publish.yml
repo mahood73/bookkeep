@@ -1,164 +1,111 @@
-name: Build and Publish Docker Image
+name: Test and build fork image
 
 on:
-  push:
-    branches:
-      - main
-      - develop
   pull_request:
-    branches:
-      - "**"
+    branches: [develop]
+  push:
+    branches: [develop]
+    tags: ['v*-hoodhaus.*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-image-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
+    if: github.repository == 'mahood73/bookkeep'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-
-      - name: Set up Python
-        run: uv python install 3.13
-
-      - name: Install dependencies
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+      - name: Set up runtime Python
+        run: uv python install 3.11
+      - name: Install test dependencies
         working-directory: backend
-        run: uv sync --dev
-
+        run: uv sync --locked --dev --python 3.11
       - name: Run tests
         working-directory: backend
-        run: uv run pytest tests/ -v
+        env:
+          DATABASE_URL: sqlite:///${{ runner.temp }}/bookkeep-ci.db
+        run: uv run --no-sync pytest tests/ -v
 
-  build-and-push:
-    runs-on: ubuntu-latest
+  build:
+    if: github.repository == 'mahood73/bookkeep'
     needs: test
-    permissions:
-      contents: write
-      pull-requests: read
-
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build without publishing
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          build-args: APP_VERSION=hoodhaus-${{ github.sha }}
+
+  publish:
+    # Only deliberately pushed fork release tags can publish. PRs, branch pushes
+    # and manual validation runs have no registry write permission or login.
+    if: >-
+      github.repository == 'mahood73/bookkeep' &&
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/v') &&
+      contains(github.ref_name, '-hoodhaus.')
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to Docker Hub
+          persist-credentials: false
+      - name: Validate release tag and source
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-hoodhaus\.[0-9]+$ ]]; then
+            echo 'Expected a fork release tag such as v1.6.2-hoodhaus.1' >&2
+            exit 1
+          fi
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/develop
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Retrieve latest version tag
-        id: get_version
-        run: |
-          latest_tag=$(git tag --list "v*" --sort=-v:refname | head -n 1)
-          latest_tag=${latest_tag:-"v0.0.0"}
-          echo "latest_tag=$latest_tag" >> "$GITHUB_ENV"
-
-      - name: Determine version bump (main only)
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        id: determine_bump
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish only the fork image
+        id: publish
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/mahood73/bookkeep:${{ github.ref_name }}
+            ghcr.io/mahood73/bookkeep:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/mahood73/bookkeep
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+          build-args: APP_VERSION=${{ github.ref_name }}
+      - name: Record immutable image reference
         env:
-          GH_TOKEN: ${{ github.token }}
+          IMAGE_DIGEST: ${{ steps.publish.outputs.digest }}
         run: |
-          pr_number=$(git log -1 --pretty=%B | grep -oE 'Merge pull request #[0-9]+' | grep -oE '[0-9]+') || true
-          if [ -z "$pr_number" ]; then
-            pr_number=$(gh pr list --state merged --base main --limit 1 --json number --jq '.[0].number')
-          fi
-
-          labels=$(gh pr view "$pr_number" --json labels --jq '.labels[].name' || echo "")
-          if echo "$labels" | grep -q 'bump:major'; then
-            bump="major"
-          elif echo "$labels" | grep -q 'bump:minor'; then
-            bump="minor"
-          elif echo "$labels" | grep -q 'bump:patch'; then
-            bump="patch"
-          else
-            bump="patch"
-          fi
-
-          semver=$(echo "${{ env.latest_tag }}" | sed 's/^v//')
-          major=$(echo "$semver" | cut -d. -f1)
-          minor=$(echo "$semver" | cut -d. -f2)
-          patch=$(echo "$semver" | cut -d. -f3)
-
-          case "$bump" in
-            major) major=$((major+1)); minor=0; patch=0 ;;
-            minor) minor=$((minor+1)); patch=0 ;;
-            patch) patch=$((patch+1)) ;;
-          esac
-
-          new_tag="v${major}.${minor}.${patch}"
-          new_version="${major}.${minor}.${patch}"
-          echo "new_tag=$new_tag" >> "$GITHUB_ENV"
-          echo "new_version=$new_version" >> "$GITHUB_ENV"
-
-      - name: Set image tags
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            image_tags="akiraslingshot/bookkeep:pr-${{ github.event.pull_request.number }}"
-            app_version="pr-${{ github.event.pull_request.number }}"
-          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
-            image_tags=$(printf "%s\n%s\n%s" \
-              "akiraslingshot/bookkeep:${{ env.new_tag }}" \
-              "akiraslingshot/bookkeep:${{ env.new_version }}" \
-              "akiraslingshot/bookkeep:latest")
-            app_version="${{ env.new_tag }}"
-          elif [ "${{ github.ref }}" = "refs/heads/develop" ]; then
-            image_tags="akiraslingshot/bookkeep:develop"
-            app_version="develop"
-          else
-            short_sha=$(git rev-parse --short HEAD)
-            image_tags="akiraslingshot/bookkeep:${short_sha}"
-            app_version="${short_sha}"
-          fi
-
-          {
-            echo "IMAGE_TAGS<<EOF"
-            echo "$image_tags"
-            echo "EOF"
-          } >> "$GITHUB_ENV"
-          echo "APP_VERSION=$app_version" >> "$GITHUB_ENV"
-
-      - name: Create and push git tag (main only)
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          if git rev-parse "${{ env.new_tag }}" >/dev/null 2>&1; then
-            echo "Tag ${{ env.new_tag }} already exists."
-          else
-            git tag "${{ env.new_tag }}"
-            git push origin "${{ env.new_tag }}"
-          fi
-
-      - name: Build and push (PR)
-        if: github.event_name == 'pull_request'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ env.IMAGE_TAGS }}
-          build-args: |
-            APP_VERSION=${{ env.APP_VERSION }}
-
-      - name: Build and push (main/develop)
-        if: github.event_name == 'push'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ env.IMAGE_TAGS }}
-          build-args: |
-            APP_VERSION=${{ env.APP_VERSION }}
+          printf 'Published image: ghcr.io/mahood73/bookkeep@%s\n' "$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
