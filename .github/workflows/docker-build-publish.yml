@@ -7,6 +7,12 @@ on:
     branches: [develop]
     tags: ['v*-hoodhaus.*']
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the selected fork release tag
+        type: boolean
+        required: true
+        default: false
 
 permissions:
   contents: read
@@ -55,11 +61,12 @@ jobs:
           build-args: APP_VERSION=hoodhaus-${{ github.sha }}
 
   publish:
-    # Only deliberately pushed fork release tags can publish. PRs, branch pushes
-    # and manual validation runs have no registry write permission or login.
+    # Only fork release tags can publish, on push or explicit manual opt-in.
+    # PRs, branch pushes and default manual runs cannot publish.
     if: >-
       github.repository == 'mahood73/bookkeep' &&
-      github.event_name == 'push' &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'workflow_dispatch' && inputs.publish)) &&
       startsWith(github.ref, 'refs/tags/v') &&
       contains(github.ref_name, '-hoodhaus.')
     needs: [test, build]
