@@ -4,6 +4,7 @@ Prowlarr release source implementation.
 Searches for book releases via Prowlarr and returns standardized Release objects.
 """
 import re
+from urllib.parse import quote
 from typing import List, Optional
 import structlog
 
@@ -70,6 +71,22 @@ class ProwlarrSource(ReleaseSource):
         """
         return self.client.test_connection()
 
+    @staticmethod
+    def _download_url(result: dict) -> str:
+        # Adapted from ntrantham's upstream PR #94. Preserve existing tracker
+        # URLs and magnet parameters; synthesize a magnet only as a fallback.
+        if result.get("downloadUrl"):
+            return result["downloadUrl"]
+        if result.get("protocol") != "torrent":
+            return ""
+        if result.get("magnetUrl"):
+            return result["magnetUrl"]
+        info_hash = result.get("infoHash") or ""
+        if re.fullmatch(r"[a-fA-F0-9]{40}|[A-Z2-7a-z]{32}", info_hash):
+            title = quote(result.get("title") or "", safe="")
+            return f"magnet:?xt=urn:btih:{info_hash}&dn={title}"
+        return ""
+
     def search(
         self,
         title: str,
@@ -123,7 +140,7 @@ class ProwlarrSource(ReleaseSource):
             if results:
                 # Add only unique results (by download URL)
                 for result in results:
-                    url = result.get("downloadUrl", "")
+                    url = self._download_url(result)
                     if url and url not in seen_urls:
                         seen_urls.add(url)
                         all_results.append(result)
@@ -184,7 +201,7 @@ class ProwlarrSource(ReleaseSource):
         if not title:
             return None
 
-        download_url = prowlarr_result.get("downloadUrl", "")
+        download_url = self._download_url(prowlarr_result)
         if not download_url:
             return None
 

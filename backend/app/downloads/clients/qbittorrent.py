@@ -440,10 +440,15 @@ class QBittorrentClient:
                 logger.error("qbittorrent_no_torrent_source")
                 return None
 
-            # qBittorrent returns "Ok." on success
+            # Older APIs return "Ok."; Web API 2.14+ returns add metadata.
+            # Based on ntrantham's upstream PR #94.
             if result != "Ok.":
-                logger.warning("qbittorrent_add_unexpected_response", result=result)
-                return None
+                success_count = getattr(result, "success_count", 0) or 0
+                added_ids = getattr(result, "added_torrent_ids", None) or []
+                accepted = success_count > 0 or (info_hash and info_hash in added_ids)
+                if not accepted:
+                    logger.warning("qbittorrent_add_unsuccessful")
+                    return None
 
             # --- Phase 3: Verify torrent was added ---
             if info_hash:
