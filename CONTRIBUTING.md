@@ -16,13 +16,16 @@ reimplementing them.
 
 The fork workflow runs backend tests on Python 3.11, matching the container
 runtime, then builds the existing Dockerfile for linux/amd64 and linux/arm64.
-Pull requests, develop pushes and manual workflow runs do not publish images.
+Pull requests, develop pushes and default manual runs do not publish images.
 They use read-only repository permissions and do not log in to a registry.
 
 ## Publishing a fork release
 
-Publishing requires a deliberately pushed tag of the form
-`v1.6.2-hoodhaus.1`. The tagged commit must already be included in `develop`.
+Publishing requires a fork tag of the form `v1.6.2-hoodhaus.1`. Push the
+tag to trigger publication, or manually run the workflow against that tag
+with the Publish input enabled. The input defaults to false, and selecting a
+branch cannot publish even with the input enabled. The tagged commit must
+already be included in `develop`.
 Tests and the validation build must pass before publication.
 
 The only image destination is `ghcr.io/mahood73/bookkeep`. Each release gets
