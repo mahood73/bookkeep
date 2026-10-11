@@ -43,6 +43,21 @@ class ReleaseTests(unittest.TestCase):
                 fork_release.main()
             self.assertEqual(api.call_count, 1)
 
+    def test_release_records_digest_and_never_sets_latest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = Path(tmp) / 'summary'
+            env = {'GITHUB_REPOSITORY': 'mahood73/bookkeep', 'GITHUB_REF': 'refs/heads/develop',
+                   'GITHUB_SHA': 'a'*40, 'RELEASE_ACTION': 'publish',
+                   'RELEASE_TAG': 'v1.6.2-hoodhaus.5', 'IMAGE_DIGEST': 'sha256:'+'b'*64,
+                   'GITHUB_STEP_SUMMARY': str(summary)}
+            with patch.dict(os.environ, env), patch.object(fork_release, 'api', side_effect=[{'object': {'sha':'a'*40}}, {}]) as api:
+                fork_release.main()
+                path, body = api.call_args.args
+                self.assertEqual(path, 'releases')
+                self.assertEqual(body['make_latest'], 'false')
+                self.assertIn('ghcr.io/mahood73/bookkeep:v1.6.2-hoodhaus.5@sha256:'+'b'*64, body['body'])
+                self.assertIn('sha256:'+'b'*64, summary.read_text())
+
 
 if __name__ == '__main__':
     unittest.main()
