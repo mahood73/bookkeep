@@ -305,8 +305,24 @@ export const hardcoverApi = {
   },
 };
 
+export interface PendingMatch {
+  id: number; title: string; author: string; hardcover_id: number | null;
+  file_isbn: string | null; booklore_id: number | null; candidate_id: number | null; reason: string;
+}
+export interface MatchPreview {
+  current: { id: number; title: string; author: string; hardcover_id: number | null; file_isbn: string | null };
+  proposed: { hardcover_id: number; hardcover_slug: string | null; title: string; author: string };
+  compilation: boolean; selected_id: number; retained_request_editions: number[]; review_token: string;
+}
+export const bookMatchesApi = {
+  pending: () => apiRequest<PendingMatch[]>('/api/book-matches/pending'),
+  preview: (bookId: number, hardcoverId: number) => apiRequest<MatchPreview>(`/api/book-matches/${bookId}/preview`, { method: 'POST', body: JSON.stringify({ hardcover_id: hardcoverId }) }),
+  apply: (bookId: number, reviewToken: string) => apiRequest<{ book_id: number; hardcover_id: number }>(`/api/book-matches/${bookId}/apply`, { method: 'POST', body: JSON.stringify({ review_token: reviewToken }) }),
+};
+
 // Books API endpoints
 export const booksApi = {
+  getByHardcoverId: (id: number) => apiRequest<{ id: number; hardcover_id: number; ebook_available: boolean; audiobook_available: boolean } | null>(`/api/books/by-hardcover/${id}`),
   getAll: (skip: number = 0, limit: number = 100) =>
     apiRequest<Array<any>>(`/api/books/?skip=${skip}&limit=${limit}`),
 

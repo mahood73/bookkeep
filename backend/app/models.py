@@ -75,6 +75,17 @@ class Book(Base):
         """Book is available if either ebook or audiobook is available."""
         return self.ebook_available or self.audiobook_available
 
+class HardcoverMatch(Base):
+    __tablename__ = "hardcover_matches"
+    book_id = Column(Integer, ForeignKey("books.id", ondelete="CASCADE"), primary_key=True)
+    reviewed_hardcover_id = Column(Integer, nullable=True)
+    reviewed_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+    pending_hardcover_id = Column(Integer, nullable=True)
+    pending_reason = Column(Text, nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=True)
+
+
 class Series(Base):
     __tablename__ = "series"
 
