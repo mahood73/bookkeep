@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Save, TestTube, CheckCircle, XCircle, Eye, EyeOff, Lock, Plus, Edit, Trash2, RefreshCw, Play, Clock, Database, Link, Shield, Loader2 } from 'lucide-react';
+import HardcoverMatchReviews from '@/components/settings/HardcoverMatchReviews';
 import ProwlarrSettings from '@/components/settings/ProwlarrSettings';
 import DownloadClientsSettings from '@/components/settings/DownloadClientsSettings';
 import DirectDownloadSettings from '@/components/settings/DirectDownloadSettings';
@@ -1239,6 +1240,7 @@ export default function Settings() {
         </TabsList>
 
         <TabsContent value="general" className="space-y-6 mt-6">
+          <HardcoverMatchReviews />
           {/* Hardcover Settings */}
           <Card className="bg-card border-border">
         <CardHeader>

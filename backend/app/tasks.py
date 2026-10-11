@@ -379,6 +379,7 @@ async def sync_from_booklore():
     from app.routers.booklore import get_default_booklore_server, get_booklore_books
     from app.routers.hardcover import lookup_book_by_slug, lookup_book_by_title_author
     from app.models import BookRequest, User
+    from app.hardcover_matching import preserve_library_identity, agrees_with_library, queue_review, normalized, resolve_work, canonical_family
     
     db: Session = SessionLocal()
     try:
@@ -483,6 +484,12 @@ async def sync_from_booklore():
                         db.rollback()
                     continue
 
+            # Resolve local identity before candidate metadata can change the author.
+            local_book = db.query(Book).filter(Book.title == title, Book.author == author).first()
+            file_isbn = metadata.get("isbn13") or metadata.get("isbn10")
+            if local_book is None and file_isbn:
+                local_book = db.query(Book).filter(Book.isbn == file_isbn).first()
+
             # hardcoverId in Booklore can be either a numeric ID or a slug
             hardcover_id_int = None
             hardcover_slug = None
@@ -534,6 +541,50 @@ async def sync_from_booklore():
                            isbn=metadata.get("isbn13") or metadata.get("isbn10"))
                 continue
             
+            candidate_review_reason = None
+            if local_book is None:
+                try:
+                    verified_candidate = await resolve_work(hardcover_id_int, db)
+                    candidate_family = await canonical_family(verified_candidate["id"], db)
+                    family_books = db.query(Book).filter(Book.hardcover_id.in_(candidate_family)).all()
+                    if len(family_books) == 1:
+                        local_book = family_books[0]
+                    elif len(family_books) > 1:
+                        candidate_review_reason = "Multiple local rows resolve to this Hardcover work"
+                    hardcover_id_int = int(verified_candidate["id"])
+                    hardcover_slug = verified_candidate.get("slug")
+                    hardcover_book_data = verified_candidate
+                except Exception as verification_error:
+                    logger.warning("booklore_candidate_verification_failed", error_type=type(verification_error).__name__)
+                    # Do not turn an unverified identifier into a new catalogue identity.
+                    candidate_review_reason = "Could not verify the library candidate's canonical identity"
+
+            if local_book is not None and await preserve_library_identity(db, local_book, hardcover_id_int):
+                # File presence belongs to the local book, not the search candidate.
+                if (not local_book.booklore_id or local_book.booklore_id == booklore_id) and normalized(local_book.title) == normalized(title) and normalized(local_book.author) == normalized(author):
+                    local_book.booklore_id = booklore_id
+                    if booklore_added_on:
+                        local_book.booklore_added_on = booklore_added_on
+                    if format_type == "audiobook":
+                        local_book.audiobook_available = True
+                    else:
+                        local_book.ebook_available = True
+                db.commit()
+                books_updated += 1
+                continue
+
+            if local_book is None and (candidate_review_reason or (hardcover_book_data and not hardcover_id_raw and not agrees_with_library(hardcover_book_data, title, author))):
+                # Keep an uncertain search result in the review queue, never as identity.
+                local_book = Book(title=title, author=author, isbn=file_isbn,
+                    booklore_id=booklore_id, booklore_added_on=booklore_added_on,
+                    ebook_available=format_type == "ebook", audiobook_available=format_type == "audiobook")
+                db.add(local_book)
+                db.flush()
+                queue_review(db, local_book, hardcover_id_int, candidate_review_reason or 'Search candidate needs title and author review')
+                db.commit()
+                books_created += 1
+                continue
+
             # Use data from Hardcover if available, otherwise fall back to Booklore
             if hardcover_book_data:
                 # Use Hardcover data for better quality
@@ -590,10 +641,10 @@ async def sync_from_booklore():
             isbn = metadata.get("isbn13") or metadata.get("isbn10")
             
             # Check if we have this book locally - try multiple identifiers for upsert
-            db_book = None
+            db_book = local_book
             
             # Try hardcover_id first (most reliable)
-            if hardcover_id_int:
+            if db_book is None and hardcover_id_int:
                 db_book = db.query(Book).filter(Book.hardcover_id == hardcover_id_int).first()
             
             # Try slug if not found
@@ -616,6 +667,12 @@ async def sync_from_booklore():
                                author=author,
                                book_id=db_book.id)
             
+            if db_book is not None and db_book is not local_book and await preserve_library_identity(db, db_book, hardcover_id_int):
+                # A fallback slug/ISBN match must obey the same identity guard.
+                db.commit()
+                books_updated += 1
+                continue
+
             if db_book:
                 # UPDATE existing book with new data
                 db_book.title = title
@@ -703,8 +760,10 @@ async def sync_from_booklore():
                             if existing_with_isbn:
                                 # Use existing book instead of creating duplicate
                                 db_book = existing_with_isbn
-                                db_book.hardcover_id = hardcover_id_int
-                                db_book.hardcover_slug = hardcover_slug
+                                if await preserve_library_identity(db, db_book, hardcover_id_int):
+                                    db.commit()
+                                    books_updated += 1
+                                    continue
                                 if booklore_id:
                                     db_book.booklore_id = booklore_id
                                 if booklore_added_on:

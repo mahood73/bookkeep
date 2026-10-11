@@ -221,6 +221,15 @@ def create_book(book: schemas.BookCreate, db: Session = Depends(database.get_db)
     }
     return schemas.BookResponse(**response_dict)
 
+@router.get("/by-hardcover/{hardcover_id}", response_model=schemas.BookResponse | None)
+def get_book_by_hardcover(hardcover_id: int, db: Session = Depends(database.get_db)):
+    book = db.query(models.Book).filter(models.Book.hardcover_id == hardcover_id).first()
+    if book is None:
+        return None
+    return schemas.BookResponse(**{**{k: v for k, v in book.__dict__.items() if not k.startswith('_')},
+        "genres": [g.strip() for g in book.genres.split(',')] if book.genres else []})
+
+
 @router.get("/{book_id}", response_model=schemas.BookResponse)
 def get_book(book_id: int, db: Session = Depends(database.get_db)):
     db_book = db.query(models.Book).filter(models.Book.id == book_id).first()

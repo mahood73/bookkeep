@@ -9,7 +9,7 @@ import sys
 import os
 
 from app.database import engine, Base
-from app.routers import users, books, hardcover, requests, settings, readarr, jobs, booklore, audiobookshelf, auth, download_settings, downloads, direct_downloads, oidc, hardcover_sync
+from app.routers import users, books, hardcover, requests, settings, readarr, jobs, booklore, audiobookshelf, auth, download_settings, downloads, direct_downloads, oidc, hardcover_sync, book_matches
 from app import cache
 
 # Configure Python's standard logging to emit structlog-style console output.
@@ -109,6 +109,7 @@ app.add_middleware(
 # Include API routers FIRST (before static files) so API routes take precedence
 app.include_router(users.router, prefix="/api/users", tags=["users"])
 app.include_router(books.router, prefix="/api/books", tags=["books"])
+app.include_router(book_matches.router, prefix="/api/book-matches", tags=["book-matches"])
 app.include_router(hardcover.router, prefix="/api/hardcover", tags=["hardcover"])
 app.include_router(requests.router, prefix="/api/requests", tags=["requests"])
 app.include_router(settings.router, prefix="/api/settings", tags=["settings"])

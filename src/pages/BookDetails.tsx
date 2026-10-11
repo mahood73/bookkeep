@@ -1,10 +1,11 @@
 import { useState } from 'react';
-import { useParams, Link, useSearchParams } from 'react-router-dom';
+import { useParams, Link, useSearchParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Star, Calendar, BookOpen, Tag, Clock, Users, Headphones, Library, ExternalLink, Trash2, Search, X, Download, Globe } from 'lucide-react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Skeleton } from '@/components/ui/skeleton';
+import { HardcoverMatchDialog } from '@/components/books/HardcoverMatchDialog';
 import { RequestDialog } from '@/components/books/RequestDialog';
 import { SearchReleaseDialog } from '@/components/books/SearchReleaseDialog';
 import { BookCard } from '@/components/books/BookCard';
@@ -18,6 +19,8 @@ import { usePageVisibility } from '@/hooks/usePageVisibility';
 export default function BookDetails() {
   const { id } = useParams();
   const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
+  const [matchOpen, setMatchOpen] = useState(false);
   const [requestOpen, setRequestOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchFormat, setSearchFormat] = useState<'ebook' | 'audiobook'>('ebook');
@@ -36,8 +39,7 @@ export default function BookDetails() {
     queryKey: ['book', 'by-hardcover', hardcoverId],
     queryFn: async () => {
       if (!hardcoverId) return null;
-      const books = await booksApi.getAll(0, 1000);
-      return books.find((b: any) => b.hardcover_id === hardcoverId) || null;
+      return booksApi.getByHardcoverId(hardcoverId);
     },
     enabled: hasHardcoverId,
     staleTime: 30_000,
@@ -431,6 +433,15 @@ export default function BookDetails() {
                     Requested • Processing
                   </div>
                 )}
+                {isAdmin && dbBook?.id && <>
+                  <Button size="lg" variant="outline" onClick={() => setMatchOpen(true)}>Correct Hardcover match</Button>
+                  <HardcoverMatchDialog bookId={dbBook.id} open={matchOpen} onOpenChange={setMatchOpen} onApplied={newId => {
+                    queryClient.invalidateQueries({ queryKey: ['book'] });
+                    queryClient.invalidateQueries({ queryKey: ['requests'] });
+                    queryClient.invalidateQueries({ queryKey: ['hardcover-match-reviews'] });
+                    navigate(`/book/${newId}`);
+                  }} />
+                </>}
                 {book.hardcoverSlug && (
                   <Button
                     size="lg"

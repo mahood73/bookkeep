@@ -13,62 +13,18 @@ fi
 export PYTHONPATH="/app/backend:$PYTHONPATH"
 
 echo "Running database migrations..."
-echo "DATABASE_URL: $DATABASE_URL"
 
 cd /app/backend
 
-# Check current Alembic tracking state
-echo "Checking Alembic version..."
-ALEMBIC_CURRENT=$(python -m alembic -c alembic.ini current 2>&1)
-echo "Alembic current: $ALEMBIC_CURRENT"
-
-# If there is no alembic_version table the command prints nothing or errors.
-# This happens when the DB was bootstrapped via SQLAlchemy create_all without
-# Alembic ever having run (legacy deployments).  We detect this and stamp the
-# database at the correct revision so Alembic only runs the truly new migrations.
-if ! echo "$ALEMBIC_CURRENT" | grep -q "(head)\|Rev:"; then
-    echo "No Alembic version found. Checking whether the database already has tables..."
-
-    TABLES_EXIST=$(python -c "
-import sys, os
-sys.path.insert(0, '/app/backend')
-from sqlalchemy import inspect, create_engine
-engine = create_engine(os.environ['DATABASE_URL'])
-try:
-    print('yes' if inspect(engine).has_table('users') else 'no')
-except Exception:
-    print('no')
-" 2>/dev/null || echo "no")
-
-    echo "Existing tables found: $TABLES_EXIST"
-
-    if [ "$TABLES_EXIST" = "yes" ]; then
-        # The database has data but was never tracked by Alembic.
-        # Check whether oidc_subject already exists to decide which revision to
-        # stamp so we don't re-run migrations that were applied via create_all.
-        OIDC_COL=$(python -c "
-import sys, os
-sys.path.insert(0, '/app/backend')
-from sqlalchemy import inspect, create_engine
-engine = create_engine(os.environ['DATABASE_URL'])
-try:
-    cols = [c['name'] for c in inspect(engine).get_columns('users')]
-    print('yes' if 'oidc_subject' in cols else 'no')
-except Exception:
-    print('no')
-" 2>/dev/null || echo "no")
-
-        if [ "$OIDC_COL" = "yes" ]; then
-            # Schema is fully up to date; stamp as head so no migrations run.
-            echo "Schema is current. Stamping database as head..."
-            python -m alembic -c alembic.ini stamp heads
-        else
-            # Schema is behind (oidc_subject missing). Stamp at 034 so Alembic
-            # runs 035 and 036 to bring the schema up to date.
-            echo "Legacy database missing recent columns. Stamping at revision 034..."
-            python -m alembic -c alembic.ini stamp 034
-        fi
-    fi
+# Query the version table instead of looking for "(head)" in human-readable
+# output. A tracked old revision is valid and must be upgraded, never stamped.
+if ! LEGACY_REVISION=$(python -m app.migration_bootstrap); then
+    echo "ERROR: Could not inspect database migration state."
+    exit 1
+fi
+if [ -n "$LEGACY_REVISION" ]; then
+    echo "Stamping legacy schema at revision $LEGACY_REVISION..."
+    python -m alembic -c alembic.ini stamp "$LEGACY_REVISION" || exit 1
 fi
 
 # Run all pending migrations.  Fail loudly if something goes wrong so the
