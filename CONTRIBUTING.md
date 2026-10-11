@@ -21,19 +21,25 @@ They use read-only repository permissions and do not log in to a registry.
 
 ## Publishing a fork release
 
-Publishing requires a fork tag of the form `v1.6.2-hoodhaus.1`. Push the
-tag to trigger publication, or manually run the workflow against that tag
-with the Publish input enabled. The input defaults to false, and selecting a
-branch cannot publish even with the input enabled. The tagged commit must
-already be included in `develop`.
-Tests and the validation build must pass before publication.
+A push to the fork's `develop` branch runs tests, then builds and publishes
+one multi-platform image and creates its GitHub release. It reserves a fresh
+`v<base>-hoodhaus.<number>` tag for the exact source commit before building.
+The base version is stored in `.github/fork-version.txt`.
+
+Pull requests and default manual runs use a separate validation-only build.
+Release runs skip that job and build once in the publishing job; the publishing
+job depends directly on successful tests. A failed build creates no release and
+may leave a reserved tag gap. Retries reserve a new tag instead of overwriting
+an existing image. To recover a missed trigger, manually run the workflow on
+`develop` with Publish enabled. Other branches cannot publish.
 
 The only image destination is `ghcr.io/mahood73/bookkeep`. Each release gets
-its fork version tag and a full source commit tag. The workflow records the
-image digest for deployment. It does not publish `latest`, push to Docker Hub,
-create Git tags, open pull requests, or deploy HoodHaus.
+a new fork version tag, with the full source commit recorded in its labels and
+GitHub release. The workflow records the
+image digest for deployment. It does not publish `latest` or moving SHA tags, push to Docker Hub,
+open pull requests, or deploy HoodHaus.
 
-The publishing job alone has `packages: write`, using the built-in
+The publishing job alone has `contents: write` and `packages: write`, using the built-in
 `GITHUB_TOKEN`. No Docker Hub credentials or personal token are required.
 Do not provide upstream Docker Hub credentials to this fork.
 
