@@ -1,519 +1,215 @@
-"""
-Z-Library provider for direct downloads.
-
-Z-Library is a shadow library that may require authentication.
-Uses their web interface to search and download books.
-"""
+"""Z-Library's JSON API, pinned to the configured HTTPS domain."""
 import re
+from typing import List, Optional
+from urllib.parse import urlsplit, urljoin
+
 import httpx
-from typing import List, Optional, Dict, Any
-from urllib.parse import quote_plus
 import structlog
 
 from .base import DirectProvider, DirectSearchResult
-from ...flaresolverr import (
-    FlareSolverrClient,
-    FlareSolverrError,
-    is_cloudflare_challenge,
-    cookie_cache,
-)
 
 logger = structlog.get_logger()
 
 
+class ZLibraryError(RuntimeError):
+    """A safe diagnostic that contains neither credentials nor response bodies."""
+
+
 class ZLibraryProvider(DirectProvider):
-    """
-    Z-Library provider using web scraping with optional authentication.
-
-    Can work with or without credentials depending on mirror availability.
-    Authentication tokens are cached for the session.
-    """
-
-    # Login domain for authentication
-    LOGIN_DOMAIN = "singlelogin.re"
-
-    # Known Z-Library mirrors (in order of preference)
-    MIRRORS = [
-        "z-lib.io",
-        "z-lib.gs",
-        "zlibrary-global.se",
-        "zlibrary.to",
-        "z-library.sk",
-    ]
-
-    USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-
-    # Extension mappings
+    DEFAULT_DOMAIN = "z-lib.gd"
+    USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     EBOOK_EXTENSIONS = ["epub", "mobi", "azw3", "pdf", "fb2"]
     AUDIOBOOK_EXTENSIONS = ["mp3", "m4b", "m4a"]
+    BOOK_PATH = re.compile(r"/book/(\d+)/([a-zA-Z0-9]+)(?:/[^?]*)?/?$")
 
-    def __init__(
-        self,
-        email: Optional[str] = None,
-        password: Optional[str] = None,
-        domain: Optional[str] = None,
-        timeout: float = 30.0,
-        flaresolverr_url: Optional[str] = None,
-    ):
-        """
-        Initialize Z-Library provider.
-
-        Args:
-            email: Z-Library account email (optional)
-            password: Z-Library account password (optional)
-            domain: Custom domain to use
-            timeout: Request timeout in seconds
-            flaresolverr_url: Optional FlareSolverr URL for Cloudflare bypass
-        """
-        self.custom_domain = domain
+    def __init__(self, email: Optional[str] = None, password: Optional[str] = None,
+                 domain: Optional[str] = None, timeout: float = 30.0,
+                 flaresolverr_url: Optional[str] = None):
+        self.domain = self.normalize_domain(domain)
         self.email = email
         self.password = password
         self.timeout = timeout
-        self.flaresolverr_url = flaresolverr_url
+        # Retain the constructor interface; API calls do not use FlareSolverr.
         self._client: Optional[httpx.AsyncClient] = None
         self._authenticated = False
-        self._cookies: Dict[str, str] = {}
-        self._user_domain: Optional[str] = None  # Personal domain after login
-        self._working_mirror: Optional[str] = None
+        self.last_error: Optional[str] = None
+
+    @classmethod
+    def normalize_domain(cls, domain: Optional[str]) -> str:
+        value = (domain or "").strip() or cls.DEFAULT_DOMAIN
+        parsed = urlsplit(value if "://" in value else "https://" + value)
+        if (parsed.scheme != "https" or not parsed.hostname or
+                parsed.username or parsed.password or parsed.netloc.lower() != parsed.hostname or
+                parsed.path not in ("", "/") or parsed.query or parsed.fragment or
+                not re.fullmatch(r"[a-zA-Z0-9.-]+", parsed.hostname)):
+            raise ValueError("Z-Library domain must be an HTTPS hostname without a port or path")
+        return parsed.hostname
 
     @property
     def name(self) -> str:
         return "zlibrary"
 
+    @property
+    def base_url(self) -> str:
+        return "https://" + self.domain
+
     async def _get_client(self) -> httpx.AsyncClient:
-        """Get or create HTTP client."""
         if self._client is None:
-            # Keep headers minimal to avoid bot detection
             self._client = httpx.AsyncClient(
                 timeout=self.timeout,
-                headers={
-                    "User-Agent": self.USER_AGENT,
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "en-US,en;q=0.9",
-                },
-                follow_redirects=True,
+                headers={"User-Agent": self.USER_AGENT, "Accept": "application/json"},
+                # Never forward credentials or silently switch domains on redirects.
+                follow_redirects=False,
             )
         return self._client
 
-    async def _find_working_mirror(self) -> Optional[str]:
-        """Find a working Z-Library mirror."""
-        if self._working_mirror:
-            return self._working_mirror
-
-        # If custom domain specified, try it first
-        mirrors_to_try = []
-        if self.custom_domain:
-            mirrors_to_try.append(self.custom_domain)
-        mirrors_to_try.extend(self.MIRRORS)
-
+    async def _request(self, method: str, path: str, data=None) -> dict:
         client = await self._get_client()
-
-        for mirror in mirrors_to_try:
-            try:
-                url = f"https://{mirror}/"
-                response = await client.get(url, timeout=10.0)
-                if response.status_code == 200 and "z-library" in response.text.lower():
-                    self._working_mirror = mirror
-                    logger.info("zlibrary_mirror_found", mirror=mirror)
-                    return mirror
-            except Exception as e:
-                logger.debug("zlibrary_mirror_failed", mirror=mirror, error=str(e))
-                continue
-
-        return None
+        try:
+            response = await client.request(method, self.base_url + path, data=data)
+        except httpx.RequestError as exc:
+            raise ZLibraryError(f"Cannot connect to configured Z-Library domain {self.domain} ({type(exc).__name__})") from None
+        if response.is_redirect:
+            raise ZLibraryError(f"Configured Z-Library domain {self.domain} redirected the API request; check the domain or browser protection")
+        if response.status_code in (403, 513, 517) or "diamwall" in response.text.lower():
+            raise ZLibraryError(f"Configured Z-Library domain {self.domain} blocks API access (HTTP {response.status_code})")
+        try:
+            payload = response.json()
+        except ValueError:
+            raise ZLibraryError(f"Configured Z-Library domain {self.domain} returned a non-JSON API response (HTTP {response.status_code})") from None
+        if not isinstance(payload, dict):
+            raise ZLibraryError("Z-Library returned an invalid API response")
+        if not payload.get("success"):
+            # Do not log the upstream body: it can include account/session fields.
+            error = str(payload.get("error", "")).lower()
+            if "incorrect email or password" in error:
+                raise ZLibraryError("Z-Library rejected the saved email or password")
+            if "authorization failed" in error:
+                raise ZLibraryError("Z-Library refused API authorization")
+            raise ZLibraryError(f"Z-Library API request failed (HTTP {response.status_code})")
+        if response.is_error:
+            raise ZLibraryError(f"Z-Library API returned HTTP {response.status_code}")
+        return payload
 
     async def _authenticate(self) -> bool:
-        """
-        Authenticate with Z-Library.
-
-        Returns:
-            True if authentication successful or not needed
-        """
-        # If we already have a working mirror without auth, that's fine
-        if self._working_mirror and not self.email:
+        if self._authenticated:
             return True
-
         if not self.email or not self.password:
-            # Try to work without authentication
-            mirror = await self._find_working_mirror()
-            return mirror is not None
-
-        if self._authenticated and self._user_domain:
+            self.last_error = "Z-Library requires a saved email and password"
+            return False
+        try:
+            payload = await self._request("POST", "/eapi/user/login", {
+                "email": self.email, "password": self.password,
+            })
+            client = await self._get_client()
+            user = payload.get("user") or {}
+            if user.get("id") and user.get("remix_userkey"):
+                client.cookies.set("remix_userid", str(user["id"]), domain=self.domain, path="/")
+                client.cookies.set("remix_userkey", str(user["remix_userkey"]), domain=self.domain, path="/")
+            if not client.cookies.get("remix_userid", domain=self.domain) or not client.cookies.get("remix_userkey", domain=self.domain):
+                raise ZLibraryError("Z-Library login returned no usable session")
+            # Ignore advertised/personal domains: the UI override is authoritative.
+            self._authenticated = True
+            self.last_error = None
             return True
-
-        client = await self._get_client()
-
-        try:
-            # Z-Library login endpoint
-            login_url = f"https://{self.LOGIN_DOMAIN}/rpc.php"
-
-            response = await client.post(
-                login_url,
-                data={
-                    "isModal": "true",
-                    "email": self.email,
-                    "password": self.password,
-                    "action": "login",
-                    "redirectUrl": "",
-                },
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Origin": f"https://{self.LOGIN_DOMAIN}",
-                    "Referer": f"https://{self.LOGIN_DOMAIN}/",
-                }
-            )
-
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                except Exception:
-                    data = {}
-
-                if data.get("success"):
-                    # Save cookies for authenticated requests
-                    self._cookies = dict(response.cookies)
-
-                    # Extract user domain from response
-                    # Z-Library assigns a personal domain after login
-                    if "user" in data and "personalDomains" in data["user"]:
-                        domains = data["user"]["personalDomains"]
-                        if domains:
-                            self._user_domain = domains[0]
-                            self._working_mirror = self._user_domain
-
-                    self._authenticated = True
-                    logger.info("zlibrary_auth_success", domain=self._user_domain)
-                    return True
-                else:
-                    logger.warning("zlibrary_auth_failed", response=data)
-                    # Fall back to finding a public mirror
-                    mirror = await self._find_working_mirror()
-                    return mirror is not None
-            else:
-                logger.warning("zlibrary_auth_http_error", status=response.status_code)
-                # Fall back to finding a public mirror
-                mirror = await self._find_working_mirror()
-                return mirror is not None
-
-        except Exception as e:
-            logger.error("zlibrary_auth_error", error=str(e))
-            # Fall back to finding a public mirror
-            mirror = await self._find_working_mirror()
-            return mirror is not None
-
-    async def search(
-        self,
-        title: str,
-        author: Optional[str] = None,
-        isbn: Optional[str] = None,
-        format_type: str = "ebook"
-    ) -> List[DirectSearchResult]:
-        """
-        Search Z-Library for books.
-
-        Args:
-            title: Book title
-            author: Author name (optional)
-            isbn: ISBN (optional)
-            format_type: "ebook" or "audiobook"
-
-        Returns:
-            List of search results
-        """
-        if not await self._authenticate():
-            logger.warning("zlibrary_search_no_mirror")
-            return []
-
-        results = []
-        client = await self._get_client()
-
-        # Build search query
-        if isbn:
-            query = isbn
-        else:
-            query = title
-            if author:
-                query = f"{title} {author}"
-
-        # Determine extensions to filter by
-        if format_type == "audiobook":
-            extensions = self.AUDIOBOOK_EXTENSIONS
-        else:
-            extensions = self.EBOOK_EXTENSIONS
-
-        try:
-            # Use working mirror (could be personal domain or public mirror)
-            mirror = self._user_domain or self._working_mirror
-            if not mirror:
-                mirror = await self._find_working_mirror()
-            if not mirror:
-                logger.error("zlibrary_no_mirror_for_search")
-                return []
-
-            base_url = f"https://{mirror}"
-
-            # URL encode the query for the path
-            encoded_query = quote_plus(query)
-
-            # Build search URL with extension filter
-            # Z-Library uses /s/query format
-            ext_params = "&".join([f"extensions[]={ext}" for ext in extensions[:3]])
-            search_url = f"{base_url}/s/{encoded_query}?{ext_params}"
-
-            logger.debug(
-                "zlibrary_search_request",
-                url=search_url,
-                query=query,
-                format_type=format_type,
-                mirror=mirror
-            )
-
-            response = await client.get(
-                search_url,
-                cookies=self._cookies if self._cookies else None
-            )
-
-            # Check for Cloudflare or access issues
-            if is_cloudflare_challenge(response.text, response.status_code):
-                logger.warning("zlibrary_cloudflare_blocked", mirror=mirror)
-
-                # Try FlareSolverr if configured
-                if self.flaresolverr_url:
-                    logger.info("zlibrary_trying_flaresolverr", url=search_url)
-                    try:
-                        fs_client = FlareSolverrClient(self.flaresolverr_url)
-                        fs_result = await fs_client.solve(search_url)
-                        await fs_client.close()
-
-                        # Cache cookies for future requests
-                        if mirror and fs_result.cookies:
-                            cookie_cache.store(mirror, fs_result.cookies)
-
-                        # Parse FlareSolverr HTML instead
-                        results = self._parse_search_results(fs_result.html, format_type, base_url)
-                        logger.info(
-                            "zlibrary_search_complete",
-                            query=query,
-                            results_count=len(results),
-                            via="flaresolverr",
-                        )
-                        return results
-                    except FlareSolverrError as e:
-                        logger.warning("zlibrary_flaresolverr_failed", error=str(e))
-
-                self._working_mirror = None
-                return []
-
-            response.raise_for_status()
-
-            # Parse results from HTML
-            results = self._parse_search_results(response.text, format_type, base_url)
-
-            logger.info(
-                "zlibrary_search_complete",
-                query=query,
-                results_count=len(results)
-            )
-
-        except httpx.HTTPStatusError as e:
-            logger.warning(
-                "zlibrary_http_error",
-                status=e.response.status_code,
-                query=query
-            )
-        except Exception as e:
-            logger.error("zlibrary_search_error", error=str(e), query=query)
-
-        return results
-
-    def _parse_search_results(
-        self,
-        html: str,
-        format_type: str,
-        base_url: str
-    ) -> List[DirectSearchResult]:
-        """
-        Parse search results from HTML response.
-
-        Z-Library uses a structured layout for search results.
-        """
-        results = []
-
-        # Pattern to find book entries - Z-Library uses /book/ URLs
-        # This is a simplified pattern - actual parsing may need adjustment
-        book_pattern = re.compile(
-            r'href="(/book/\d+/[^"]+)"[^>]*>.*?class="[^"]*bookTitle[^"]*"[^>]*>([^<]+)</a>',
-            re.IGNORECASE | re.DOTALL
-        )
-
-        # Alternative pattern for simpler structures
-        simple_pattern = re.compile(
-            r'href="(/book/\d+/[^"]+)"[^>]*>([^<]{3,100})</a>',
-            re.IGNORECASE
-        )
-
-        matches = book_pattern.findall(html) or simple_pattern.findall(html)
-
-        seen_urls = set()
-        for match in matches[:20]:  # Limit to 20 results
-            book_path, title_text = match
-            title_text = title_text.strip()
-
-            if not title_text or len(title_text) < 3:
-                continue
-
-            # Skip duplicates
-            if book_path in seen_urls:
-                continue
-            seen_urls.add(book_path)
-
-            # Extract metadata from surrounding context
-            start_idx = html.find(book_path)
-            context = html[max(0, start_idx - 300):start_idx + len(book_path) + 500]
-
-            file_format = self._extract_format_from_context(context, format_type)
-            size_bytes = self._extract_size_from_context(context)
-            language = self._extract_language_from_context(context)
-            author = self._extract_author_from_context(context)
-            year = self._extract_year_from_context(context)
-
-            if not file_format:
-                continue
-
-            # Build URLs
-            info_url = f"{base_url}{book_path}"
-            # For Z-Library, we need to visit the book page to get download link
-            download_url = info_url  # Will need to be resolved later
-
-            result = DirectSearchResult(
-                title=title_text,
-                download_url=download_url,
-                format=file_format,
-                size_bytes=size_bytes,
-                author=author,
-                language=language,
-                year=year,
-                quality_score=self._calculate_quality(file_format, size_bytes, format_type),
-                provider=self.name,
-                info_url=info_url,
-            )
-            results.append(result)
-
-        return results
-
-    def _extract_format_from_context(self, context: str, format_type: str) -> Optional[str]:
-        """Extract file format from HTML context."""
-        context_lower = context.lower()
-
-        if format_type == "audiobook":
-            for ext in self.AUDIOBOOK_EXTENSIONS:
-                if f".{ext}" in context_lower or f">{ext}<" in context_lower:
-                    return ext
-        else:
-            for ext in self.EBOOK_EXTENSIONS:
-                if f".{ext}" in context_lower or f">{ext}<" in context_lower:
-                    return ext
-
-        return None
-
-    def _extract_size_from_context(self, context: str) -> int:
-        """Extract file size from HTML context."""
-        size_pattern = re.compile(r'(\d+(?:\.\d+)?)\s*(KB|MB|GB)', re.IGNORECASE)
-        match = size_pattern.search(context)
-
-        if match:
-            value = float(match.group(1))
-            unit = match.group(2).upper()
-            multipliers = {"KB": 1024, "MB": 1024**2, "GB": 1024**3}
-            return int(value * multipliers.get(unit, 1))
-
-        return 0
-
-    def _extract_language_from_context(self, context: str) -> Optional[str]:
-        """Extract language from HTML context."""
-        lang_patterns = [
-            (r'\b(english)\b', 'en'),
-            (r'\b(spanish|español)\b', 'es'),
-            (r'\b(french|français)\b', 'fr'),
-            (r'\b(german|deutsch)\b', 'de'),
-            (r'\b(italian|italiano)\b', 'it'),
-            (r'\b(portuguese)\b', 'pt'),
-            (r'\b(russian)\b', 'ru'),
-        ]
-
-        context_lower = context.lower()
-        for pattern, code in lang_patterns:
-            if re.search(pattern, context_lower):
-                return code
-
-        return None
-
-    def _extract_author_from_context(self, context: str) -> Optional[str]:
-        """Extract author name from HTML context."""
-        # Look for author patterns
-        author_pattern = re.compile(r'class="[^"]*author[^"]*"[^>]*>([^<]+)</a>', re.IGNORECASE)
-        match = author_pattern.search(context)
-        if match:
-            return match.group(1).strip()
-        return None
-
-    def _extract_year_from_context(self, context: str) -> Optional[int]:
-        """Extract publication year from HTML context."""
-        year_pattern = re.compile(r'\b(19\d{2}|20[0-2]\d)\b')
-        match = year_pattern.search(context)
-        if match:
-            return int(match.group(1))
-        return None
-
-    def _calculate_quality(self, file_format: str, size_bytes: int, format_type: str) -> float:
-        """Calculate quality score for ranking."""
-        score = 50.0
-
-        if format_type == "ebook":
-            format_scores = {"epub": 20, "azw3": 15, "mobi": 10, "pdf": 5, "fb2": 5}
-        else:
-            format_scores = {"m4b": 20, "mp3": 10, "m4a": 15}
-
-        score += format_scores.get(file_format, 0)
-
-        # Size scoring
-        if format_type == "ebook":
-            if 100_000 < size_bytes < 50_000_000:
-                score += 10
-        else:
-            if 50_000_000 < size_bytes < 2_000_000_000:
-                score += 10
-
-        return min(100, max(0, score))
+        except ZLibraryError as exc:
+            self.last_error = str(exc)
+            logger.warning("zlibrary_auth_failed", domain=self.domain, error=self.last_error)
+            return False
 
     async def test_connection(self) -> bool:
-        """Test if Z-Library is accessible."""
+        return await self._authenticate()
+
+    async def search(self, title: str, author: Optional[str] = None,
+                     isbn: Optional[str] = None, format_type: str = "ebook") -> List[DirectSearchResult]:
+        if not await self._authenticate():
+            return []
+        extensions = self.AUDIOBOOK_EXTENSIONS if format_type == "audiobook" else self.EBOOK_EXTENSIONS
+        query = isbn or " ".join(part for part in [title, author] if part)
         try:
-            # Try authentication first if credentials provided
-            if self.email and self.password:
-                if await self._authenticate():
-                    logger.info("zlibrary_test_success", authenticated=True, domain=self._user_domain)
-                    return True
+            payload = await self._request("POST", "/eapi/book/search", {
+                "message": query, "extensions[]": extensions, "limit": "20", "page": "1",
+            })
+            results = []
+            seen = set()
+            for book in payload.get("books") or []:
+                if not isinstance(book, dict):
+                    continue
+                ext = str(book.get("extension") or "").lower().lstrip(".")
+                book_id, book_hash = str(book.get("id") or ""), str(book.get("hash") or "")
+                if ext not in extensions or not book_id.isdigit() or not re.fullmatch(r"[a-zA-Z0-9]+", book_hash):
+                    continue
+                book_title = str(book.get("title") or "").strip()
+                url = f"{self.base_url}/book/{book_id}/{book_hash}"
+                if not book_title or url in seen:
+                    continue
+                seen.add(url)
+                size = self._parse_size(book.get("filesize"))
+                language = str(book.get("language") or "").lower()
+                language = {"english": "en", "french": "fr", "german": "de", "spanish": "es", "italian": "it", "portuguese": "pt", "russian": "ru"}.get(language, language) or None
+                year_text = str(book.get("year") or "")
+                results.append(DirectSearchResult(
+                    title=book_title, download_url=url, info_url=url,
+                    format=ext, size_bytes=size, author=book.get("author"), language=language,
+                    year=int(year_text) if year_text.isdigit() else None,
+                    quality_score=self._calculate_quality(ext, size, format_type), provider=self.name,
+                ))
+            return results
+        except ZLibraryError as exc:
+            self.last_error = str(exc)
+            logger.warning("zlibrary_search_failed", domain=self.domain, error=self.last_error)
+            return []
 
-            # Fall back to finding a public mirror
-            mirror = await self._find_working_mirror()
-            if mirror:
-                logger.info("zlibrary_test_success", authenticated=False, mirror=mirror)
-                return True
+    def is_book_url(self, url: str) -> bool:
+        parsed = urlsplit(url)
+        return parsed.scheme == "https" and parsed.netloc == self.domain and bool(self.BOOK_PATH.fullmatch(parsed.path))
 
-            logger.warning("zlibrary_test_failed", error="No accessible mirror found")
-            return False
-        except Exception as e:
-            logger.warning("zlibrary_test_failed", error=str(e))
-            return False
+    async def resolve_download_url(self, book_url: str) -> str:
+        if not self.is_book_url(book_url):
+            raise ZLibraryError("Z-Library book URL does not match the configured domain")
+        if not await self._authenticate():
+            raise ZLibraryError(self.last_error or "Z-Library login failed")
+        match = self.BOOK_PATH.fullmatch(urlsplit(book_url).path)
+        payload = await self._request("GET", f"/eapi/book/{match[1]}/{match[2]}/file")
+        file_data = payload.get("file") or {}
+        link = file_data.get("downloadLink") or payload.get("downloadLink")
+        if not isinstance(link, str) or not link:
+            raise ZLibraryError("Z-Library returned no download link; check availability and account quota")
+        url = urljoin(self.base_url, link)
+        parsed = urlsplit(url)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+            raise ZLibraryError("Z-Library returned an invalid download link")
+        return url
+
+    async def copy_session_to(self, client: httpx.Client):
+        """Keep session cookies scoped to the configured domain, never the file host."""
+        source = await self._get_client()
+        for name in ("remix_userid", "remix_userkey"):
+            value = source.cookies.get(name, domain=self.domain)
+            if value:
+                client.cookies.set(name, value, domain=self.domain, path="/")
+
+    @staticmethod
+    def _parse_size(value) -> int:
+        if isinstance(value, (int, float)):
+            return max(0, int(value))
+        text = str(value or "").strip()
+        if text.isdigit():
+            return int(text)
+        match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(B|KB|MB|GB)", text, re.IGNORECASE)
+        if not match:
+            return 0
+        return int(float(match[1]) * {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3}[match[2].upper()])
+
+    @staticmethod
+    def _calculate_quality(file_format: str, size_bytes: int, format_type: str) -> float:
+        scores = {"m4b": 20, "mp3": 10, "m4a": 15} if format_type == "audiobook" else {"epub": 20, "azw3": 15, "mobi": 10, "pdf": 5, "fb2": 5}
+        score = 50 + scores.get(file_format, 0)
+        lower, upper = (50_000_000, 2_000_000_000) if format_type == "audiobook" else (100_000, 50_000_000)
+        return min(100, score + (10 if lower < size_bytes < upper else 0))
 
     async def close(self):
-        """Close HTTP client."""
         if self._client:
             await self._client.aclose()
             self._client = None
         self._authenticated = False
-        self._cookies = {}
-        self._user_domain = None
-        self._working_mirror = None

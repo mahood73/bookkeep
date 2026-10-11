@@ -4,6 +4,7 @@ Direct HTTP download handler.
 Downloads files directly via HTTP/HTTPS without requiring external download clients.
 Used for direct download sources like Anna's Archive and Z-Library.
 """
+import asyncio
 import os
 import re
 import time
@@ -20,6 +21,8 @@ from bs4 import BeautifulSoup
 from .. import DownloadHandler, DownloadStatus, DownloadState, register_handler
 from ...models import DownloadTask as DownloadTaskModel, AppSettings, DirectDownloadSettings
 from sqlalchemy.orm import Session
+
+from ..direct.providers.zlibrary import ZLibraryProvider, ZLibraryError
 
 from ..flaresolverr import (
     solve_sync,
@@ -629,6 +632,25 @@ class DirectHandler(DownloadHandler):
             logger.error("libgen_resolve_error", url=url, error=str(e))
             return None
 
+    def _zlibrary_provider(self) -> ZLibraryProvider:
+        settings = self.db_session.query(DirectDownloadSettings).first() if self.db_session else None
+        return ZLibraryProvider(
+            domain=settings.zlibrary_domain if settings else None,
+            email=settings.zlibrary_email if settings else None,
+            password=settings.zlibrary_password if settings else None,
+        )
+
+    def _resolve_zlibrary_url(self, url: str, client: httpx.Client) -> str:
+        async def resolve():
+            provider = self._zlibrary_provider()
+            try:
+                resolved = await provider.resolve_download_url(url)
+                await provider.copy_session_to(client)
+                return resolved
+            finally:
+                await provider.close()
+        return asyncio.run(resolve())
+
     def _try_download_from_source(
         self,
         source: DownloadSource,
@@ -655,7 +677,7 @@ class DirectHandler(DownloadHandler):
                     attempt.error = "Could not resolve slow download CDN link"
                     return None
                 url = resolved
-                logger.info("direct_slow_download_resolved", source=source.name, cdn_url=url[:80])
+                logger.info("direct_slow_download_resolved", source=source.name, cdn_url=source.url[:80])
 
             elif source.source_type == "libgen":
                 if "ads.php" in url:
@@ -665,12 +687,16 @@ class DirectHandler(DownloadHandler):
                         return None
                     url = resolved
 
+            elif source.source_type == "zlib-api":
+                url = self._resolve_zlibrary_url(url, client)
+
             # Update status - use short source type label for UI
             source_labels = {
                 "aa-slow-nowait": "Fast",
                 "aa-slow-wait": "Waitlist",
                 "libgen": "Libgen",
                 "zlib": "Z-Library",
+                "zlib-api": "Z-Library",
             }
             short_label = source_labels.get(source.source_type, source.source_type)
             if status_callback:
@@ -680,14 +706,14 @@ class DirectHandler(DownloadHandler):
                     message=short_label
                 ))
 
-            logger.info("direct_trying_source", source=source.name, type=source.source_type, url=url[:80])
+            logger.info("direct_trying_source", source=source.name, type=source.source_type, url=source.url[:80])
 
             # Try with cached cookies and user-agent from previous FlareSolverr solve
             hostname = urlparse(url).hostname
             cached_cookies = cookie_cache.get(hostname) if hostname else {}
             cached_ua = cookie_cache.get_user_agent(hostname) if hostname else ""
 
-            request_headers = {"Referer": "https://annas-archive.org/"}
+            request_headers = {"Referer": source.url if source.source_type == "zlib-api" else "https://annas-archive.org/"}
             if cached_ua:
                 request_headers["User-Agent"] = cached_ua
 
@@ -713,9 +739,9 @@ class DirectHandler(DownloadHandler):
 
                 if status_code == 403:
                     # Try FlareSolverr
-                    fs_url = self._get_flaresolverr_url()
+                    fs_url = None if source.source_type == "zlib-api" else self._get_flaresolverr_url()
                     if fs_url:
-                        logger.info("direct_403_trying_flaresolverr", source=source.name, url=url[:80])
+                        logger.info("direct_403_trying_flaresolverr", source=source.name, url=source.url[:80])
 
                         if status_callback:
                             status_callback(DownloadStatus(
@@ -740,7 +766,7 @@ class DirectHandler(DownloadHandler):
                                 cookie_count=len(result.cookies),
                                 has_user_agent=bool(result.user_agent),
                                 solved_url=result.url[:80] if result.url else "",
-                                original_url=url[:80],
+                                original_url=source.url[:80],
                             )
 
                             # Close the 403 response and retry with cookies + matching UA
@@ -792,12 +818,12 @@ class DirectHandler(DownloadHandler):
                             return None
                     else:
                         attempt.error = "Access denied (403)"
-                        logger.warning("direct_source_403", source=source.name, url=url[:80])
+                        logger.warning("direct_source_403", source=source.name, url=source.url[:80])
                         return None
 
                 if status_code == 429:
                     attempt.error = "Rate limited (429)"
-                    logger.warning("direct_source_429", source=source.name, url=url[:80])
+                    logger.warning("direct_source_429", source=source.name, url=source.url[:80])
                     return None
 
                 if status_code >= 400:
@@ -816,7 +842,7 @@ class DirectHandler(DownloadHandler):
 
                     if first_chunk and (b"<html" in first_chunk.lower() or b"<!doctype" in first_chunk.lower()):
                         attempt.error = "Received HTML instead of file"
-                        logger.warning("direct_source_html", source=source.name, url=url[:80])
+                        logger.warning("direct_source_html", source=source.name, url=source.url[:80])
                         return None
 
                 # Get file info
@@ -903,13 +929,14 @@ class DirectHandler(DownloadHandler):
                     stream_cm.__exit__(None, None, None)
 
         except Exception as e:
+            error_text = f"Z-Library transfer failed ({type(e).__name__})" if source.source_type == "zlib-api" and not isinstance(e, ZLibraryError) else str(e)
             error_type = type(e).__name__
 
             if hasattr(e, "response") and hasattr(e.response, "status_code") and e.response.status_code == 403:
                 # Try FlareSolverr on 403 exception
-                fs_url = self._get_flaresolverr_url()
+                fs_url = None if source.source_type == "zlib-api" else self._get_flaresolverr_url()
                 if fs_url:
-                    logger.info("direct_403_exception_trying_flaresolverr", source=source.name, url=url[:80])
+                    logger.info("direct_403_exception_trying_flaresolverr", source=source.name, url=source.url[:80])
                     try:
                         result = solve_sync(fs_url, url)
                         hostname = urlparse(url).hostname
@@ -935,22 +962,22 @@ class DirectHandler(DownloadHandler):
                         logger.warning("direct_flaresolverr_exception_failed", source=source.name, error=str(fs_err))
 
                 attempt.error = "Access denied (403)"
-                logger.warning("direct_source_403", source=source.name, url=url[:80])
+                logger.warning("direct_source_403", source=source.name, url=source.url[:80])
                 return None
 
-            if "429" in str(e) or (hasattr(e, "response") and hasattr(e.response, "status_code") and e.response.status_code == 429):
+            if "429" in error_text or (hasattr(e, "response") and hasattr(e.response, "status_code") and e.response.status_code == 429):
                 attempt.error = "Rate limited (429)"
-                logger.warning("direct_source_429", source=source.name, url=url[:80])
+                logger.warning("direct_source_429", source=source.name, url=source.url[:80])
                 return None
 
-            if "timeout" in error_type.lower() or "timeout" in str(e).lower():
+            if "timeout" in error_type.lower() or "timeout" in error_text.lower():
                 attempt.error = "Timeout"
                 logger.warning("direct_source_timeout", source=source.name)
                 return None
 
-            if "connect" in error_type.lower() or "connection" in str(e).lower():
-                attempt.error = f"Connection error: {str(e)[:50]}"
-                logger.warning("direct_source_connect_error", source=source.name, error=str(e))
+            if "connect" in error_type.lower() or "connection" in error_text.lower():
+                attempt.error = f"Connection error: {error_text[:50]}"
+                logger.warning("direct_source_connect_error", source=source.name, error=error_text)
                 return None
 
             if hasattr(e, "response") and hasattr(e.response, "status_code"):
@@ -958,8 +985,8 @@ class DirectHandler(DownloadHandler):
                 logger.warning("direct_source_http_error", source=source.name, status=e.response.status_code)
                 return None
 
-            attempt.error = str(e)[:100]
-            logger.error("direct_source_error", source=source.name, error=str(e))
+            attempt.error = error_text[:100]
+            logger.error("direct_source_error", source=source.name, error=error_text)
             return None
 
         finally:
@@ -1015,7 +1042,13 @@ class DirectHandler(DownloadHandler):
                     ))
 
                 # Parse the info page to get all download sources
-                sources = self._parse_annas_archive_sources(task.download_url, client)
+                provider = self._zlibrary_provider() if ZLibraryProvider.BOOK_PATH.fullmatch(urlparse(task.download_url).path) else None
+                if provider and provider.is_book_url(task.download_url):
+                    sources = [DownloadSource(task.download_url, "Z-Library", "zlib-api", 40)]
+                elif provider:
+                    raise ZLibraryError("Z-Library book URL does not match the configured domain; search again")
+                else:
+                    sources = self._parse_annas_archive_sources(task.download_url, client)
 
                 if not sources:
                     logger.warning("direct_no_sources_found", task_id=task.id, url=task.download_url)
