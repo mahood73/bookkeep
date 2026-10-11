@@ -306,9 +306,12 @@ export default function DirectDownloadSettings() {
                       id="zlib-domain"
                       value={form.zlibrary_domain}
                       onChange={(e) => setForm({ ...form, zlibrary_domain: e.target.value })}
-                      placeholder="singlelogin.re"
+                      placeholder="z-lib.gd"
                       className="bg-secondary border-border"
                     />
+                    <p className="text-xs text-muted-foreground">
+                      Leave blank to use z-lib.gd. An override applies to login, search, and downloads.
+                    </p>
                   </div>
                 </div>
               )}
