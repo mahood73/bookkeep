@@ -5,11 +5,10 @@ on:
     branches: [develop]
   push:
     branches: [develop]
-    tags: ['v*-hoodhaus.*']
   workflow_dispatch:
     inputs:
       publish:
-        description: Publish the selected fork release tag
+        description: Publish a new fork release from develop
         type: boolean
         required: true
         default: false
@@ -24,17 +23,19 @@ concurrency:
 jobs:
   test:
     if: github.repository == 'mahood73/bookkeep'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v10.3.0
       - name: Set up runtime Python
         run: uv python install 3.11
       - name: Install test dependencies
         working-directory: backend
         run: uv sync --locked --dev --python 3.11
+      - name: Test release safeguards
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
       - name: Run tests
         working-directory: backend
         env:
@@ -42,17 +43,20 @@ jobs:
         run: uv run --no-sync pytest tests/ -v
 
   build:
-    if: github.repository == 'mahood73/bookkeep'
+    if: >-
+      github.repository == 'mahood73/bookkeep' &&
+      (github.event_name == 'pull_request' ||
+       (github.event_name == 'workflow_dispatch' && !inputs.publish))
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-qemu-action@v4.4.0
+      - uses: docker/setup-buildx-action@v4.4.1
       - name: Build without publishing
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7.4.0
         with:
           context: .
           file: Dockerfile
@@ -61,58 +65,57 @@ jobs:
           build-args: APP_VERSION=hoodhaus-${{ github.sha }}
 
   publish:
-    # Only fork release tags can publish, on push or explicit manual opt-in.
-    # PRs, branch pushes and default manual runs cannot publish.
+    # Merged develop commits publish; PRs never receive write credentials.
     if: >-
       github.repository == 'mahood73/bookkeep' &&
+      github.ref == 'refs/heads/develop' &&
       (github.event_name == 'push' ||
-       (github.event_name == 'workflow_dispatch' && inputs.publish)) &&
-      startsWith(github.ref, 'refs/tags/v') &&
-      contains(github.ref_name, '-hoodhaus.')
-    needs: [test, build]
-    runs-on: ubuntu-latest
+       (github.event_name == 'workflow_dispatch' && inputs.publish))
+    needs: test
+    runs-on: ubuntu-24.04
     permissions:
-      contents: read
+      contents: write
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Validate release tag and source
-        shell: bash
-        run: |
-          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-hoodhaus\.[0-9]+$ ]]; then
-            echo 'Expected a fork release tag such as v1.6.2-hoodhaus.1' >&2
-            exit 1
-          fi
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/develop
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - name: Validate source
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/develop
+      - name: Reserve a new fork release tag
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ACTION: reserve
+        run: python3 .github/scripts/fork_release.py
+      - uses: docker/setup-qemu-action@v4.4.0
+      - uses: docker/setup-buildx-action@v4.4.1
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Publish only the fork image
         id: publish
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7.4.0
         with:
           context: .
           file: Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ghcr.io/mahood73/bookkeep:${{ github.ref_name }}
-            ghcr.io/mahood73/bookkeep:sha-${{ github.sha }}
+            ghcr.io/mahood73/bookkeep:${{ steps.release.outputs.tag }}
           labels: |
             org.opencontainers.image.source=https://github.com/mahood73/bookkeep
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ github.ref_name }}
-          build-args: APP_VERSION=${{ github.ref_name }}
-      - name: Record immutable image reference
+            org.opencontainers.image.version=${{ steps.release.outputs.tag }}
+          build-args: APP_VERSION=${{ steps.release.outputs.tag }}
+      - name: Create GitHub release with immutable image reference
         env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ACTION: publish
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
           IMAGE_DIGEST: ${{ steps.publish.outputs.digest }}
-        run: |
-          printf 'Published image: ghcr.io/mahood73/bookkeep@%s\n' "$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+        run: python3 .github/scripts/fork_release.py
