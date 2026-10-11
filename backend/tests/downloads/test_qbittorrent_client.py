@@ -446,7 +446,8 @@ class TestAddTorrent:
 
         # Verify tags were passed
         call_kwargs = mock_qb_client.client.torrents_add.call_args.kwargs
-        assert call_kwargs['tags'] == ["book", "epub"]
+        assert call_kwargs['tags'][:2] == ["book", "epub"]
+        assert call_kwargs['tags'][2].startswith('bookkeep-add-')
 
     def test_add_torrent_already_exists(self, mock_qb_client):
         from app.downloads.clients.qbittorrent import Conflict409Error
@@ -1089,14 +1090,17 @@ class TestAddTorrentWithPrecomputedHash:
 
 
 
-def test_structured_add_retains_task_tracking_through_completion(mock_qb_client):
+@pytest.mark.parametrize("source", ["magnet", "url_pending", "url_returned_id"])
+def test_structured_add_retains_task_tracking_through_completion(mock_qb_client, source):
     from threading import Event
     from qbittorrentapi import torrents
     from app.downloads.handlers.torrent import TorrentHandler
     from app.models import DownloadTask
 
     info_hash = "abcdef1234567890abcdef1234567890abcdef12"
-    metadata = {"success_count": 1, "added_torrent_ids": [info_hash]}
+    metadata = {"success_count": 1, "pending_count": 0, "added_torrent_ids": [info_hash]}
+    if source == "url_pending":
+        metadata = {"success_count": 0, "pending_count": 1, "added_torrent_ids": []}
     # Exercise the native response when running with the container's newer API
     # library, while retaining compatibility with the locked test dependency.
     response_type = getattr(torrents, "TorrentsAddedMetadata", None)
@@ -1105,14 +1109,44 @@ def test_structured_add_retains_task_tracking_through_completion(mock_qb_client)
     mock_qb_client.client.torrents_info.return_value = [Mock(hash=info_hash)]
     mock_qb_client.client.torrents_categories.return_value = {}
     task = DownloadTask(id=1, book_id=1, format="ebook", source="manual", protocol="torrent",
-        release_data_json="{}", download_url=f"magnet:?xt=urn:btih:{info_hash}")
+        release_data_json="{}", download_url=(f"magnet:?xt=urn:btih:{info_hash}" if source == "magnet" else "https://indexer.invalid/download"))
     db = Mock()
     db.query.return_value.filter.return_value.first.return_value = None
     handler = TorrentHandler(db_session=db)
-    with patch.object(handler, "_get_client", return_value=mock_qb_client), patch.object(
+    with patch.object(mock_qb_client, "_download_torrent_file", return_value=None), patch.object(handler, "_get_client", return_value=mock_qb_client), patch.object(
         mock_qb_client, "get_download_status", return_value={"state": DownloadState.SEEDING, "progress": 100}
     ), patch.object(mock_qb_client, "get_completed_download_path", return_value="/downloads/test.epub"):
         result = handler.download(task, Event(), status_callback=lambda status: db.commit())
     assert result == "/downloads/test.epub"
     assert task.client_download_id == info_hash
     assert task.client_type == "qbittorrent"
+
+
+@pytest.mark.parametrize('metadata', [
+    {'success_count': 0, 'pending_count': 1, 'failure_count': 0, 'added_torrent_ids': []},
+    {'success_count': 1, 'pending_count': 0, 'failure_count': 0,
+     'added_torrent_ids': ['abcdef1234567890abcdef1234567890abcdef12']},
+])
+def test_url_add_tracks_pending_or_returned_id(mock_qb_client, metadata):
+    from qbittorrentapi.torrents import TorrentsAddedMetadata
+    expected = 'abcdef1234567890abcdef1234567890abcdef12'
+    mock_qb_client.client.torrents_add.return_value = TorrentsAddedMetadata(metadata)
+    mock_qb_client.client.torrents_categories.return_value = {'books': {}}
+    calls = []
+    def torrents_info(**kwargs):
+        calls.append(kwargs)
+        # A shared tag belongs to a different existing torrent.
+        if kwargs.get('tag') == 'bookkeep':
+            return [Mock(hash='0'*40)]
+        return [Mock(hash=expected)]
+    mock_qb_client.client.torrents_info.side_effect = torrents_info
+    with patch.object(mock_qb_client, '_download_torrent_file', return_value=None), patch(
+        'app.downloads.clients.qbittorrent.time.sleep'
+    ):
+        actual = mock_qb_client.add_torrent(url='https://indexer.invalid/download', tags=['bookkeep'])
+    assert actual == expected
+    assert not any(call.get('tag') == 'bookkeep' for call in calls)
+    if metadata['pending_count']:
+        sent_tags = mock_qb_client.client.torrents_add.call_args.kwargs['tags']
+        assert 'bookkeep' in sent_tags
+        assert any(tag.startswith('bookkeep-add-') for tag in sent_tags)

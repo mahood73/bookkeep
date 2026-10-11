@@ -4,6 +4,7 @@ qBittorrent client implementation.
 Provides downloading capabilities for torrent files via qBittorrent Web API.
 """
 import time
+from uuid import uuid4
 import hashlib
 from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path
@@ -411,6 +412,14 @@ class QBittorrentClient:
             else:
                 logger.warning("qbittorrent_torrent_bytes_hash_extraction_failed")
 
+        # A URL can be accepted for asynchronous fetching before its hash exists.
+        # Correlate this add only; the shared "bookkeep" tag is not an identity.
+        lookup_tags = tags
+        if not info_hash:
+            correlation_tag = "bookkeep-add-" + uuid4().hex
+            tags = list(tags or []) + [correlation_tag]
+            lookup_tags = [correlation_tag]
+
         # --- Phase 2: Add torrent to qBittorrent ---
         try:
             # Prepare add parameters
@@ -445,10 +454,16 @@ class QBittorrentClient:
             if result != "Ok.":
                 success_count = getattr(result, "success_count", 0) or 0
                 added_ids = getattr(result, "added_torrent_ids", None) or []
-                accepted = success_count > 0 or (info_hash and info_hash in added_ids)
+                pending_count = getattr(result, "pending_count", 0) or 0
+                accepted = (success_count > 0 or pending_count > 0 or
+                            (info_hash and info_hash in added_ids) or
+                            (not info_hash and len(added_ids) == 1))
                 if not accepted:
                     logger.warning("qbittorrent_add_unsuccessful")
                     return None
+                if not info_hash and len(added_ids) == 1:
+                    # This call submits one source, so one returned ID is exact.
+                    info_hash = added_ids[0]
 
             # --- Phase 3: Verify torrent was added ---
             if info_hash:
@@ -469,7 +484,7 @@ class QBittorrentClient:
                 # No hash available - fall back to tag-based lookup (legacy)
                 logger.warning("qbittorrent_no_precomputed_hash_falling_back_to_tags")
                 time.sleep(0.5)
-                info_hash = self._get_torrent_hash(url, magnet, torrent_file, category, tags)
+                info_hash = self._get_torrent_hash(url, magnet, torrent_file, category, lookup_tags)
                 if info_hash:
                     logger.info("qbittorrent_torrent_added", info_hash=info_hash)
                 else:
@@ -482,7 +497,7 @@ class QBittorrentClient:
             if info_hash:
                 return info_hash
             # Fall back to tag-based lookup
-            return self._get_torrent_hash(url, magnet, torrent_file, category, tags)
+            return self._get_torrent_hash(url, magnet, torrent_file, category, lookup_tags)
 
         except Exception as e:
             logger.error("qbittorrent_add_failed", error=str(e))
