@@ -16,7 +16,8 @@ def sessions():
     Base.metadata.create_all(engine)
     factory=sessionmaker(bind=engine,expire_on_commit=False)
     with factory() as db:
-        db.add(models.User(id=1,email='fixture@example.invalid',username='fixture',is_admin=True))
+        db.add(models.User(id=1,email='fixture@example.invalid',username='fixture',is_admin=True,
+                           auto_approve_ebooks=False,auto_approve_audiobooks=False))
         db.commit()
     yield factory
     engine.dispose()
