@@ -8,6 +8,7 @@ from typing import List, Dict, Optional
 from datetime import datetime, timezone
 import structlog
 import time
+from .. import SearchError
 
 logger = structlog.get_logger()
 
@@ -84,7 +85,8 @@ class ProwlarrClient:
         categories: Optional[List[int]] = None,
         indexer_ids: Optional[List[int]] = None,
         limit: int = 100,
-        offset: int = 0
+        offset: int = 0,
+        *, strict: bool = False,
     ) -> List[Dict]:
         """
         Search Prowlarr for releases.
@@ -139,6 +141,8 @@ class ProwlarrClient:
             )
             response.raise_for_status()
             results = response.json()
+            if strict and not isinstance(results, list):
+                raise ValueError("Invalid result list")
 
             elapsed = time.time() - start_time
             logger.info(
@@ -152,6 +156,8 @@ class ProwlarrClient:
             return results
 
         except requests.exceptions.Timeout:
+            if strict:
+                raise SearchError("Prowlarr search timed out; retry manually.") from None
             logger.error(
                 "prowlarr_search_timeout",
                 query=query,
@@ -159,6 +165,8 @@ class ProwlarrClient:
             )
             return []
         except requests.exceptions.HTTPError as e:
+            if strict:
+                raise SearchError(f"Prowlarr search failed (HTTP {e.response.status_code}); retry manually.") from None
             logger.error(
                 "prowlarr_search_http_error",
                 query=query,
@@ -167,6 +175,8 @@ class ProwlarrClient:
             )
             return []
         except Exception as e:
+            if strict:
+                raise SearchError("Prowlarr search failed; retry manually.") from None
             logger.error(
                 "prowlarr_search_error",
                 query=query,
@@ -180,7 +190,8 @@ class ProwlarrClient:
         categories: Optional[List[int]] = None,
         indexer_ids: Optional[List[int]] = None,
         limit: int = 100,
-        max_retries: int = 2
+        max_retries: int = 2,
+        *, strict: bool = False,
     ) -> List[Dict]:
         """
         Search with automatic retry on failure.
@@ -202,7 +213,8 @@ class ProwlarrClient:
             query=query,
             categories=categories,
             indexer_ids=indexer_ids,
-            limit=limit
+            limit=limit,
+            **({"strict": True} if strict else {}),
         )
 
         # If no results and categories were specified, retry without categories
@@ -216,7 +228,8 @@ class ProwlarrClient:
                 query=query,
                 categories=None,  # Remove category filter
                 indexer_ids=indexer_ids,
-                limit=limit
+                limit=limit,
+                **({"strict": True} if strict else {}),
             )
 
         return results

@@ -143,8 +143,7 @@ async def create_request(
             orchestrator = DownloadOrchestrator(db_session=db)
             task = orchestrator.search_and_download(
                 book=db_request.book,
-                format_type=db_request.format,
-                source_name="prowlarr"
+                format_type=db_request.format
             )
 
             if task:
@@ -503,8 +502,7 @@ async def request_series(
                 orchestrator = DownloadOrchestrator(db_session=db)
                 task = orchestrator.search_and_download(
                     book=book,
-                    format_type=format,
-                    source_name="prowlarr"
+                    format_type=format
                 )
 
                 if task:
@@ -758,8 +756,7 @@ async def update_request(
             orchestrator = DownloadOrchestrator(db_session=db)
             task = orchestrator.search_and_download(
                 book=db_request.book,
-                format_type=db_request.format,
-                source_name="prowlarr"
+                format_type=db_request.format
             )
 
             if task:

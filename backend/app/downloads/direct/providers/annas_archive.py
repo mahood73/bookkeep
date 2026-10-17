@@ -18,6 +18,8 @@ from ...flaresolverr import (
     cookie_cache,
 )
 
+from ... import SearchError
+
 logger = structlog.get_logger()
 
 
@@ -106,7 +108,8 @@ class AnnasArchiveProvider(DirectProvider):
         title: str,
         author: Optional[str] = None,
         isbn: Optional[str] = None,
-        format_type: str = "ebook"
+        format_type: str = "ebook",
+        *, strict: bool = False,
     ) -> List[DirectSearchResult]:
         """
         Search Anna's Archive for books.
@@ -116,6 +119,8 @@ class AnnasArchiveProvider(DirectProvider):
             author: Author name (optional)
             isbn: ISBN (optional)
             format_type: "ebook" or "audiobook"
+            strict: Automatic mode: propagate failures, use only the configured
+                mirror, skip challenge retries, and require known language labels.
 
         Returns:
             List of search results
@@ -124,8 +129,10 @@ class AnnasArchiveProvider(DirectProvider):
         client = await self._get_client()
 
         # Find a working mirror
-        mirror = await self._find_working_mirror()
+        mirror = self.base_url if strict else await self._find_working_mirror()
         if not mirror:
+            if strict:
+                raise SearchError("Anna's Archive is unavailable; retry manually.")
             logger.error("annas_no_working_mirror")
             return []
 
@@ -181,6 +188,8 @@ class AnnasArchiveProvider(DirectProvider):
             # Check for Cloudflare challenge
             cf_solved = False
             if is_cloudflare_challenge(html_text, response.status_code):
+                if strict:
+                    raise SearchError("Anna's Archive search is blocked; retry manually.")
                 logger.warning(
                     "annas_cloudflare_blocked",
                     mirror=mirror,
@@ -214,8 +223,11 @@ class AnnasArchiveProvider(DirectProvider):
             if not cf_solved:
                 response.raise_for_status()
 
+            if strict and "<table" not in html_text.lower():
+                raise SearchError("Anna's Archive returned an unrecognised search page; retry manually.")
+
             # Parse results from HTML using BeautifulSoup
-            results = self._parse_search_results(html_text, format_type, mirror)
+            results = self._parse_search_results(html_text, format_type, mirror, strict=strict)
 
             logger.info(
                 "annas_search_complete",
@@ -225,12 +237,18 @@ class AnnasArchiveProvider(DirectProvider):
             )
 
         except httpx.HTTPStatusError as e:
+            if strict:
+                raise SearchError(f"Anna's Archive search failed (HTTP {e.response.status_code}); retry manually.") from None
             logger.warning(
                 "annas_http_error",
                 status=e.response.status_code,
                 query=query
             )
+        except SearchError:
+            raise
         except Exception as e:
+            if strict:
+                raise SearchError("Anna's Archive search failed; retry manually.") from None
             logger.error("annas_search_error", error=str(e), query=query)
 
         return results
@@ -239,7 +257,8 @@ class AnnasArchiveProvider(DirectProvider):
         self,
         html: str,
         format_type: str,
-        base_url: str
+        base_url: str,
+        *, strict: bool = False,
     ) -> List[DirectSearchResult]:
         """
         Parse search results from HTML response using BeautifulSoup.
@@ -276,7 +295,7 @@ class AnnasArchiveProvider(DirectProvider):
                 continue
 
             try:
-                result = self._parse_table_row(row, cells, format_type, base_url)
+                result = self._parse_table_row(row, cells, format_type, base_url, strict=strict)
                 if result and result.info_url not in seen_ids:
                     seen_ids.add(result.info_url)
                     results.append(result)
@@ -293,7 +312,8 @@ class AnnasArchiveProvider(DirectProvider):
         row,
         cells,
         format_type: str,
-        base_url: str
+        base_url: str,
+        *, strict: bool = False,
     ) -> Optional[DirectSearchResult]:
         """
         Parse a single table row into a DirectSearchResult.
@@ -363,7 +383,7 @@ class AnnasArchiveProvider(DirectProvider):
         language = None
         if len(cells) > 7:
             language = cells[7].get_text(strip=True)
-            language = self._normalize_language(language)
+            language = self._normalize_language(language, strict=strict)
 
         # Extract format from cells[9]
         file_format = None
@@ -403,7 +423,7 @@ class AnnasArchiveProvider(DirectProvider):
             info_url=info_url,
         )
 
-    def _normalize_language(self, lang: Optional[str]) -> Optional[str]:
+    def _normalize_language(self, lang: Optional[str], *, strict: bool = False) -> Optional[str]:
         """Normalize language name to code."""
         if not lang:
             return None
@@ -412,6 +432,7 @@ class AnnasArchiveProvider(DirectProvider):
         lang_map = {
             "english": "en",
             "en": "en",
+            "eng": "en",
             "spanish": "es",
             "es": "es",
             "french": "fr",
@@ -431,6 +452,10 @@ class AnnasArchiveProvider(DirectProvider):
             "japanese": "ja",
             "ja": "ja",
         }
+        # Automatic eligibility must never turn an unfamiliar or mixed label
+        # into English merely because its first two characters are 'en'.
+        if strict:
+            return lang_map.get(lang_lower)
         return lang_map.get(lang_lower, lang_lower[:2] if len(lang_lower) >= 2 else None)
 
     def _parse_size(self, size_text: str) -> int:

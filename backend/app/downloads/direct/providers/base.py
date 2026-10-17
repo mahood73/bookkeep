@@ -54,7 +54,8 @@ class DirectProvider(ABC):
         title: str,
         author: Optional[str] = None,
         isbn: Optional[str] = None,
-        format_type: str = "ebook"  # "ebook" or "audiobook"
+        format_type: str = "ebook",  # "ebook" or "audiobook"
+        *, strict: bool = False,
     ) -> List[DirectSearchResult]:
         """
         Search for books matching the query.
@@ -64,6 +65,8 @@ class DirectProvider(ABC):
             author: Author name (optional, improves matching)
             isbn: ISBN-10 or ISBN-13 (optional, best match)
             format_type: "ebook" or "audiobook"
+            strict: Automatic attempt: raise SearchError on source failure,
+                avoid failed-source retries, and preserve known identity/language evidence
 
         Returns:
             List of search results from this provider

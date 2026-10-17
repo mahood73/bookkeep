@@ -16,7 +16,7 @@ from ..models import Book, ProwlarrServer, DownloadClient, DownloadTask, AppSett
 from app.auth import require_admin, get_current_user
 from app import models
 from ..downloads.prowlarr import ProwlarrSource
-from ..downloads import DownloadOrchestrator
+from ..downloads import DownloadOrchestrator, SearchError
 from ..downloads.handlers.direct import get_download_log
 
 router = APIRouter()
@@ -413,8 +413,7 @@ async def auto_download(
         # Search and download (orchestrator picks the best release)
         task = orchestrator.search_and_download(
             book=book,
-            format_type=format_type,
-            source_name="prowlarr"
+            format_type=format_type
         )
 
         if not task:
@@ -432,17 +431,19 @@ async def auto_download(
 
         return DownloadResponse(
             task_id=task.id,
-            status="downloading",
-            message=f"Automatically downloading best release: {task.release_title}"
+            status=task.state,
+            message=f"Tracking download: {task.release_title}"
         )
 
     except HTTPException:
         raise
+    except SearchError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from None
     except Exception as e:
         logger.error("auto_download_failed", book_id=book_id, error=str(e))
         raise HTTPException(
             status_code=500,
-            detail=f"Auto-download failed: {str(e)}"
+            detail="Auto-download failed; retry manually."
         )
 
 
