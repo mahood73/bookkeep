@@ -92,7 +92,8 @@ class ProwlarrSource(ReleaseSource):
         title: str,
         author: Optional[str] = None,
         isbn: Optional[str] = None,
-        format_type: str = "ebook"
+        format_type: str = "ebook",
+        *, strict: bool = False,
     ) -> List[Release]:
         """
         Search for book releases.
@@ -134,7 +135,8 @@ class ProwlarrSource(ReleaseSource):
                 query=query,
                 categories=categories,
                 indexer_ids=self.indexer_ids,
-                limit=100
+                limit=100,
+                **({"strict": True} if strict else {}),
             )
 
             if results:

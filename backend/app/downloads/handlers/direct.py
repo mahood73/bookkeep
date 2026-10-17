@@ -6,6 +6,7 @@ Used for direct download sources like Anna's Archive and Z-Library.
 """
 import asyncio
 import os
+import json
 import re
 import time
 import httpx
@@ -315,7 +316,7 @@ class DirectHandler(DownloadHandler):
             if counter > 1000:
                 raise ValueError("Could not find unique filename")
 
-    def _parse_annas_archive_sources(self, url: str, client: httpx.Client) -> List[DownloadSource]:
+    def _parse_annas_archive_sources(self, url: str, client: httpx.Client, *, automatic: bool = False) -> List[DownloadSource]:
         """
         Parse Anna's Archive MD5 page and extract all download sources.
 
@@ -348,7 +349,7 @@ class DirectHandler(DownloadHandler):
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 403:
                     # Try FlareSolverr
-                    fs_url = self._get_flaresolverr_url()
+                    fs_url = None if automatic else self._get_flaresolverr_url()
                     if fs_url:
                         logger.info("annas_md5_403_trying_flaresolverr", url=url)
                         try:
@@ -668,6 +669,7 @@ class DirectHandler(DownloadHandler):
         Returns path to downloaded file or None if failed.
         """
         url = source.url
+        automatic = self._automatic_selection(task)
 
         try:
             # Resolve intermediary pages
@@ -739,7 +741,7 @@ class DirectHandler(DownloadHandler):
 
                 if status_code == 403:
                     # Try FlareSolverr
-                    fs_url = None if source.source_type == "zlib-api" else self._get_flaresolverr_url()
+                    fs_url = None if automatic or source.source_type == "zlib-api" else self._get_flaresolverr_url()
                     if fs_url:
                         logger.info("direct_403_trying_flaresolverr", source=source.name, url=source.url[:80])
 
@@ -934,7 +936,7 @@ class DirectHandler(DownloadHandler):
 
             if hasattr(e, "response") and hasattr(e.response, "status_code") and e.response.status_code == 403:
                 # Try FlareSolverr on 403 exception
-                fs_url = None if source.source_type == "zlib-api" else self._get_flaresolverr_url()
+                fs_url = None if automatic or source.source_type == "zlib-api" else self._get_flaresolverr_url()
                 if fs_url:
                     logger.info("direct_403_exception_trying_flaresolverr", source=source.name, url=source.url[:80])
                     try:
@@ -993,6 +995,13 @@ class DirectHandler(DownloadHandler):
             if not attempt.ended_at:
                 attempt.ended_at = datetime.utcnow()
 
+    @staticmethod
+    def _automatic_selection(task: DownloadTaskModel) -> bool:
+        try:
+            return json.loads(task.release_data_json or '{}').get('metadata', {}).get('automatic_selection') is True
+        except (ValueError, TypeError, AttributeError):
+            return False
+
     def download(
         self,
         task: DownloadTaskModel,
@@ -1015,6 +1024,7 @@ class DirectHandler(DownloadHandler):
         Returns:
             Path to downloaded file, or None if failed/cancelled
         """
+        automatic = self._automatic_selection(task)
         # Initialize download log
         download_log = DownloadLog(task_id=task.id, started_at=datetime.utcnow())
         _download_logs[task.id] = download_log
@@ -1048,7 +1058,7 @@ class DirectHandler(DownloadHandler):
                 elif provider:
                     raise ZLibraryError("Z-Library book URL does not match the configured domain; search again")
                 else:
-                    sources = self._parse_annas_archive_sources(task.download_url, client)
+                    sources = self._parse_annas_archive_sources(task.download_url, client, **({'automatic': True} if automatic else {}))
 
                 if not sources:
                     logger.warning("direct_no_sources_found", task_id=task.id, url=task.download_url)
@@ -1067,6 +1077,9 @@ class DirectHandler(DownloadHandler):
                     count=len(sources),
                     sources=[s.name for s in sources[:5]]
                 )
+
+                if automatic:
+                    sources = sources[:1]
 
                 # Try each source in order
                 for i, source in enumerate(sources):
@@ -1138,7 +1151,8 @@ class DirectHandler(DownloadHandler):
                     )
 
                     # Small delay between attempts
-                    time.sleep(1)
+                    if not automatic:
+                        time.sleep(1)
 
                 # All sources failed
                 download_log.final_result = "error: all sources failed"
@@ -1148,7 +1162,7 @@ class DirectHandler(DownloadHandler):
                     status_callback(DownloadStatus(
                         state=DownloadState.ERROR,
                         progress=0.0,
-                        message="All sources failed"
+                        message="Download failed; retry manually." if automatic else "All sources failed"
                     ))
 
                 logger.error(

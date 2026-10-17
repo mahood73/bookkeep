@@ -7,6 +7,7 @@ import httpx
 import structlog
 
 from .base import DirectProvider, DirectSearchResult
+from ... import SearchError
 
 logger = structlog.get_logger()
 
@@ -86,6 +87,8 @@ class ZLibraryProvider(DirectProvider):
                 raise ZLibraryError("Z-Library rejected the saved email or password")
             if "authorization failed" in error:
                 raise ZLibraryError("Z-Library refused API authorization")
+            if "daily download limit" in error or "download quota exceeded" in error:
+                raise ZLibraryError("Z-Library reports the account download quota is exhausted")
             raise ZLibraryError(f"Z-Library API request failed (HTTP {response.status_code})")
         if response.is_error:
             raise ZLibraryError(f"Z-Library API returned HTTP {response.status_code}")
@@ -121,8 +124,11 @@ class ZLibraryProvider(DirectProvider):
         return await self._authenticate()
 
     async def search(self, title: str, author: Optional[str] = None,
-                     isbn: Optional[str] = None, format_type: str = "ebook") -> List[DirectSearchResult]:
+                     isbn: Optional[str] = None, format_type: str = "ebook", *, strict: bool = False) -> List[DirectSearchResult]:
+        """Search once; strict automatic mode propagates safe source failures."""
         if not await self._authenticate():
+            if strict:
+                raise SearchError(f"{self.last_error or 'Z-Library authentication failed'}; retry manually.")
             return []
         extensions = self.AUDIOBOOK_EXTENSIONS if format_type == "audiobook" else self.EBOOK_EXTENSIONS
         query = isbn or " ".join(part for part in [title, author] if part)
@@ -130,6 +136,9 @@ class ZLibraryProvider(DirectProvider):
             payload = await self._request("POST", "/eapi/book/search", {
                 "message": query, "extensions[]": extensions, "limit": "20", "page": "1",
             })
+            if strict and not isinstance(payload.get("books"), list):
+                raise ZLibraryError("Z-Library returned no valid search result list")
+            self.last_error = None
             results = []
             seen = set()
             for book in payload.get("books") or []:
@@ -157,6 +166,8 @@ class ZLibraryProvider(DirectProvider):
             return results
         except ZLibraryError as exc:
             self.last_error = str(exc)
+            if strict:
+                raise SearchError(f"Z-Library search failed: {self.last_error}. Retry manually.") from None
             logger.warning("zlibrary_search_failed", domain=self.domain, error=self.last_error)
             return []
 

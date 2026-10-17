@@ -6,15 +6,19 @@ Manages the complete download workflow from search to completion.
 import os
 import shutil
 import threading
+import unicodedata
 from pathlib import Path
 from typing import Optional, List, Dict
 from threading import Event
 from datetime import datetime, timezone
 import structlog
 from sqlalchemy.orm import Session
+from sqlalchemy import text
+from dataclasses import replace
 
 from . import (
     Release,
+    SearchError,
     DownloadState,
     DownloadStatus,
     get_source,
@@ -22,11 +26,13 @@ from . import (
     list_sources,
     list_handlers,
 )
-from ..models import Book, DownloadTask, AppSettings, DownloadClient, DirectDownloadSettings
+from ..models import Book, DownloadTask, AppSettings, DownloadClient, DirectDownloadSettings, BookRequest
 from ..database import SessionLocal
 from .prowlarr.utils import AUDIOBOOK_FORMATS, EBOOK_FORMATS
 
 logger = structlog.get_logger()
+ACTIVE_STATES = ('queued', 'downloading', 'checking', 'processing', 'paused')
+FULFILLED_STATES = ('complete', 'seeding')
 
 
 class DownloadOrchestrator:
@@ -54,7 +60,7 @@ class DownloadOrchestrator:
         self._active_downloads: Dict[int, Event] = {}  # task_id -> cancel_event
         self._download_threads: Dict[int, threading.Thread] = {}
 
-    def get_available_protocols(self, db: Optional[Session] = None) -> List[str]:
+    def get_available_protocols(self, db: Optional[Session] = None, *, strict: bool = False) -> List[str]:
         """
         Get list of protocols that have enabled download clients configured.
 
@@ -88,6 +94,8 @@ class DownloadOrchestrator:
             return protocols
 
         except Exception as e:
+            if strict:
+                raise SearchError("Download client configuration could not be read; retry manually.") from None
             logger.error("orchestrator_get_protocols_failed", error=str(e))
             # Default to torrent if we can't determine (safer fallback)
             return ["torrent"]
@@ -99,7 +107,8 @@ class DownloadOrchestrator:
         self,
         book: Book,
         format_type: str = "ebook",
-        source_name: str = "prowlarr"
+        source_name: str = "prowlarr",
+        *, strict: bool = False,
     ) -> List[Release]:
         """
         Search for book releases.
@@ -129,14 +138,15 @@ class DownloadOrchestrator:
                 title=book.title,
                 author=book.author,
                 isbn=book.isbn,
-                format_type=format_type
+                format_type=format_type,
+                **({"strict": True} if strict else {}),
             )
 
             # Filter releases to only include protocols with configured clients
-            available_protocols = self.get_available_protocols(db)
+            available_protocols = self.get_available_protocols(db, strict=strict)
             total_before_filter = len(releases)
 
-            if available_protocols:
+            if available_protocols or strict:
                 releases = [r for r in releases if r.protocol in available_protocols]
 
             filtered_count = total_before_filter - len(releases)
@@ -153,6 +163,11 @@ class DownloadOrchestrator:
             return releases
 
         except Exception as e:
+            if strict:
+                if isinstance(e, SearchError):
+                    raise
+                label = 'Prowlarr' if source_name == 'prowlarr' else 'Direct'
+                raise SearchError(f"{label} search failed; retry manually.") from None
             logger.error(
                 "orchestrator_search_failed",
                 book_id=book.id,
@@ -167,7 +182,8 @@ class DownloadOrchestrator:
         self,
         book: Book,
         release: Release,
-        format_type: str
+        format_type: str,
+        *, automatic: bool = False,
     ) -> Optional[DownloadTask]:
         """
         Create a download task from a release.
@@ -183,6 +199,23 @@ class DownloadOrchestrator:
         db = self.db_session or SessionLocal()
 
         try:
+            # Serialize claims for this book across sessions/workers. A no-op write
+            # takes a row lock on PostgreSQL and a write lock on SQLite without
+            # changing the book's updated_at timestamp.
+            db.execute(text('UPDATE books SET id = id WHERE id = :id'), {'id': book.id})
+            states = ACTIVE_STATES + (FULFILLED_STATES if automatic else ())
+            existing = db.query(DownloadTask).filter(
+                DownloadTask.book_id == book.id, DownloadTask.format == format_type,
+                DownloadTask.state.in_(states),
+            ).first()
+            if existing:
+                db.commit()
+                return existing
+            if automatic:
+                available = db.query(getattr(Book, f'{format_type}_available')).filter(Book.id == book.id).scalar()
+                if available:
+                    db.commit()
+                    return None
             # Store release data as JSON
             import json
             from datetime import datetime
@@ -267,6 +300,7 @@ class DownloadOrchestrator:
             True if download started successfully
         """
         db = self.db_session or SessionLocal()
+        task = None
 
         try:
             task = db.query(DownloadTask).filter(DownloadTask.id == task_id).first()
@@ -274,10 +308,15 @@ class DownloadOrchestrator:
                 logger.error("orchestrator_task_not_found", task_id=task_id)
                 return False
 
-            # Check if already downloading
-            if task_id in self._active_downloads:
-                logger.warning("orchestrator_already_downloading", task_id=task_id)
-                return False
+            # Only one worker may claim a queued task, even when different
+            # orchestrator instances are serving overlapping HTTP requests.
+            claimed = db.query(DownloadTask).filter(
+                DownloadTask.id == task_id, DownloadTask.state == 'queued',
+            ).update({DownloadTask.state: 'processing'}, synchronize_session=False)
+            db.commit()
+            db.refresh(task)
+            if not claimed:
+                return task.state in ACTIVE_STATES + FULFILLED_STATES
 
             # Create cancel event
             cancel_event = Event()
@@ -296,7 +335,14 @@ class DownloadOrchestrator:
             return True
 
         except Exception as e:
-            logger.error("orchestrator_start_failed", task_id=task_id, error=str(e))
+            db.rollback()
+            if task:
+                task.state = 'error'
+                task.message = 'Download could not start; retry manually.'
+                db.commit()
+            self._active_downloads.pop(task_id, None)
+            self._download_threads.pop(task_id, None)
+            logger.error("orchestrator_start_failed", task_id=task_id)
             return False
 
         finally:
@@ -347,7 +393,9 @@ class DownloadOrchestrator:
 
             # Status callback
             def status_callback(status: DownloadStatus):
-                task.state = status.state.value
+                # A handler can report QUEUED while resolving its selected source.
+                # The task already has a worker; don't make it claimable again.
+                task.state = 'processing' if status.state == DownloadState.QUEUED else status.state.value
                 task.progress = status.progress
                 if status.message:
                     task.message = status.message
@@ -412,6 +460,7 @@ class DownloadOrchestrator:
                 # Failed
                 if task.state != "paused":  # Don't override paused state
                     task.state = "error"
+                    task.message = task.message or 'Download failed; check the download log and retry manually.'
                 db.commit()
 
                 # Cleanup
@@ -427,6 +476,7 @@ class DownloadOrchestrator:
                 task = db.query(DownloadTask).filter(DownloadTask.id == task_id).first()
                 if task:
                     task.state = "error"
+                    task.message = 'Download failed; check the download log and retry manually.'
                     db.commit()
             except:
                 pass
@@ -789,6 +839,8 @@ class DownloadOrchestrator:
 
             if success:
                 # Restart monitoring
+                task.state = 'queued'
+                db.commit()
                 return self.start_download(task_id)
 
             return False
@@ -801,59 +853,84 @@ class DownloadOrchestrator:
             if not self.db_session:
                 db.close()
 
+    @staticmethod
+    def _direct_match(book: Book, release: Release, format_type: str) -> bool:
+        def normalize(value):
+            if not isinstance(value, str):
+                return ''
+            return ' '.join(''.join(c for c in unicodedata.normalize('NFKC', value).casefold()
+                                   if c.isalnum() or c.isspace()).split())
+
+        formats = AUDIOBOOK_FORMATS if format_type == 'audiobook' else EBOOK_FORMATS
+        title, author = normalize(book.title), normalize(book.author)
+        metadata = release.metadata if isinstance(release.metadata, dict) else {}
+        language = release.language.strip().lower() if isinstance(release.language, str) else ''
+        file_format = release.format.lower().lstrip('.') if isinstance(release.format, str) else ''
+        return bool(
+            title and author
+            and normalize(release.title) == title
+            and normalize(metadata.get('author')) == author
+            and language in {'en', 'eng', 'english'}
+            and file_format in formats
+            and release.protocol == 'direct'
+        )
+
     def search_and_download(
         self,
         book: Book,
-        format_type: str = "ebook",
-        source_name: str = "prowlarr"
+        format_type: str = 'ebook',
+        source_name: Optional[str] = None,
     ) -> Optional[DownloadTask]:
-        """
-        Complete workflow: search, select best release, and start download.
+        """Fulfil a new request or explicit retry, using Prowlarr before direct sources."""
+        db = self.db_session or SessionLocal()
+        try:
+            return self._automatic_download(db, book, format_type, source_name)
+        except SearchError as exc:
+            message = f'[Automatic download] {exc}'
+            for request in db.query(BookRequest).filter(
+                BookRequest.book_id == book.id, BookRequest.format == format_type,
+                BookRequest.status.in_(['approved', 'processing']),
+            ).all():
+                if message not in (request.admin_notes or ''):
+                    request.admin_notes = ((request.admin_notes or '') + '\n' + message).strip()
+            db.commit()
+            logger.warning('automatic_download_failed', book_id=book.id, format=format_type, message=str(exc))
+            raise
+        finally:
+            if not self.db_session:
+                db.close()
 
-        Args:
-            book: Book to download
-            format_type: "ebook" or "audiobook"
-            source_name: Source to use (default: "prowlarr")
-
-        Returns:
-            Created DownloadTask or None
-        """
-        # Search for releases
-        releases = self.search_releases(book, format_type, source_name)
-
-        if not releases:
-            logger.warning(
-                "orchestrator_no_releases",
-                book_id=book.id,
-                format=format_type
-            )
+    def _automatic_download(self, db, book, format_type, source_name):
+        if format_type not in {'ebook', 'audiobook'}:
+            raise SearchError('Unsupported request format; select ebook or audiobook.')
+        existing = db.query(DownloadTask).filter(
+            DownloadTask.book_id == book.id, DownloadTask.format == format_type,
+            DownloadTask.state.in_(ACTIVE_STATES + FULFILLED_STATES),
+        ).first()
+        if existing:
+            return existing
+        if db.query(getattr(Book, f'{format_type}_available')).filter(Book.id == book.id).scalar():
             return None
-
-        # Select best release (already sorted by quality)
-        best_release = releases[0]
-
-        logger.info(
-            "orchestrator_selected_release",
-            book_id=book.id,
-            release_title=best_release.title,
-            quality=best_release.quality_score,
-            protocol=best_release.protocol
-        )
-
-        # Create download task
-        task = self.create_download_task(book, best_release, format_type)
-
-        if not task:
-            return None
-
-        # Start download
-        success = self.start_download(task.id)
-
-        if not success:
-            logger.error("orchestrator_start_download_failed", task_id=task.id)
-            return None
-
-        return task
+        for name in ([source_name] if source_name else ['prowlarr', 'direct']):
+            if name == 'direct' and 'direct' not in self.get_available_protocols(db, strict=True):
+                continue
+            releases = self.search_releases(book, format_type, name, strict=True)
+            if name == 'direct':
+                releases = [r for r in releases if self._direct_match(book, r, format_type)]
+            if not releases:
+                continue
+            best_release = max(releases, key=lambda release: release.quality_score)
+            best_release = replace(best_release, metadata={**best_release.metadata, 'automatic_selection': True})
+            task = self.create_download_task(book, best_release, format_type, automatic=True)
+            if task and self.start_download(task.id):
+                return task
+            # A selected download failure is not permission to try another source.
+            if task and task.state == 'queued':
+                task.state = 'error'
+                task.message = 'Selected download could not start; retry manually.'
+                db.commit()
+            raise SearchError('Selected download could not start; check Downloads and retry manually.')
+        return None
 
     def get_active_downloads(self) -> List[int]:
         """

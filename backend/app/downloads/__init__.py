@@ -14,6 +14,10 @@ from enum import Enum
 from datetime import datetime
 
 
+class SearchError(RuntimeError):
+    """Safe source failure, distinct from a successful empty search."""
+
+
 class DownloadState(Enum):
     """Download state enumeration"""
     QUEUED = "queued"
@@ -132,7 +136,8 @@ class ReleaseSource(ABC):
         title: str,
         author: Optional[str] = None,
         isbn: Optional[str] = None,
-        format_type: str = "ebook"  # "ebook" or "audiobook"
+        format_type: str = "ebook",  # "ebook" or "audiobook"
+        *, strict: bool = False,
     ) -> List[Release]:
         """
         Search for releases matching book metadata.
@@ -142,6 +147,7 @@ class ReleaseSource(ABC):
             author: Book author (optional)
             isbn: ISBN-10 or ISBN-13 (optional)
             format_type: "ebook" or "audiobook"
+            strict: Raise SearchError on source failure instead of returning an empty list
 
         Returns:
             List of Release objects
@@ -306,6 +312,9 @@ def get_source(name: str, db_session=None) -> ReleaseSource:
         finally:
             if not db_session:
                 db.close()
+
+    if name == "direct":
+        return _SOURCES[name](db_session=db_session)
 
     # Default instantiation for other sources
     return _SOURCES[name]()

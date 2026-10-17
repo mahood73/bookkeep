@@ -10,7 +10,7 @@ from typing import List, Optional
 import structlog
 from sqlalchemy.orm import Session
 
-from .. import Release, ReleaseSource, register_source
+from .. import Release, ReleaseSource, SearchError, register_source
 from .providers import DirectProvider, DirectSearchResult, AnnasArchiveProvider, ZLibraryProvider
 from ...models import DirectDownloadSettings
 
@@ -91,7 +91,8 @@ class DirectDownloadSource(ReleaseSource):
         title: str,
         author: Optional[str] = None,
         isbn: Optional[str] = None,
-        format_type: str = "ebook"
+        format_type: str = "ebook",
+        *, strict: bool = False,
     ) -> List[Release]:
         """
         Search all enabled providers and return unified results.
@@ -122,7 +123,7 @@ class DirectDownloadSource(ReleaseSource):
         )
 
         # Run provider searches concurrently using asyncio
-        all_results = self._run_async_searches(title, author, isbn, format_type)
+        all_results = self._run_async_searches(title, author, isbn, format_type, strict=strict)
 
         # Flatten and convert to Release objects
         releases = []
@@ -153,7 +154,8 @@ class DirectDownloadSource(ReleaseSource):
         title: str,
         author: Optional[str],
         isbn: Optional[str],
-        format_type: str
+        format_type: str,
+        *, strict: bool = False,
     ) -> List[DirectSearchResult]:
         """
         Run async provider searches and collect results.
@@ -162,11 +164,14 @@ class DirectDownloadSource(ReleaseSource):
         """
         async def gather_results():
             tasks = [
-                provider.search(title, author, isbn, format_type)
+                provider.search(title, author, isbn, format_type, **({"strict": True} if strict else {}))
                 for provider in self._providers
             ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            return results
+            try:
+                return await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                if strict:
+                    await asyncio.gather(*(p.close() for p in self._providers), return_exceptions=True)
 
         def run_in_thread():
             """Run async code in a new event loop in a separate thread."""
@@ -186,6 +191,10 @@ class DirectDownloadSource(ReleaseSource):
         all_results = []
         for i, result in enumerate(results):
             if isinstance(result, Exception):
+                if strict:
+                    if isinstance(result, SearchError):
+                        raise result
+                    raise SearchError("Direct search failed; retry manually.") from None
                 logger.warning(
                     "direct_provider_search_failed",
                     provider=self._providers[i].name,
