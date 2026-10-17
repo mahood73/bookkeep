@@ -1725,8 +1725,9 @@ async def _ensure_book_in_db(hardcover_id: int, token: str, db: Session) -> Opti
 
 
 async def sync_hardcover_lists_for_user(user_id: int) -> None:
-    """Sync Hardcover to-read / lists for a single user and create pending requests."""
+    """Sync Hardcover lists and fulfil newly auto-approved requests."""
     from app.models import UserHardcoverSync, BookRequest, User
+    from app.downloads.orchestrator import DownloadOrchestrator
     from app.encryption import decrypt_value
     import json
 
@@ -1834,6 +1835,24 @@ async def sync_hardcover_lists_for_user(user_id: int) -> None:
                 except Exception as e:
                     db.rollback()
                     logger.warning("hardcover_sync_request_failed", book_id=db_book.id, error=str(e))
+                    continue
+
+                if initial_status == "approved":
+                    try:
+                        task = DownloadOrchestrator(db_session=db).search_and_download(db_book, fmt)
+                        if task:
+                            db_request.status = "processing"
+                            db.commit()
+                        logger.info("hardcover_sync_fulfilment_attempted",
+                                    request_id=db_request.id, format=fmt,
+                                    task_id=task.id if task else None)
+                    except Exception as error:
+                        # The request is already durable. A failed attempt must not
+                        # abort other books or be retried by the next list sync.
+                        db.rollback()
+                        logger.warning("hardcover_sync_fulfilment_failed",
+                                       request_id=db_request.id, format=fmt,
+                                       error_type=type(error).__name__)
 
             await asyncio.sleep(0.2)  # gentle rate limit
 
