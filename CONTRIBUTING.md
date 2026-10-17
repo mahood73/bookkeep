@@ -19,6 +19,10 @@ runtime, then builds the existing Dockerfile for linux/amd64 and linux/arm64.
 Pull requests, develop pushes and default manual runs do not publish images.
 They use read-only repository permissions and do not log in to a registry.
 
+For frontend changes, run `npm test` to render the book-details page with
+cached fixture responses and the real application providers. These tests make
+no network calls. Run `npm run build` to check the production bundle.
+
 ## Publishing a fork release
 
 A push to the fork's `develop` branch runs tests, then builds and publishes
