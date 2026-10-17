@@ -517,6 +517,37 @@ async def sync_from_booklore():
                     except Exception as e:
                         logger.warning("hardcover_lookup_failed", slug=hardcover_slug, error=str(e))
             
+            # The catalogue may already know this work from Hardcover discovery
+            # or a list request. Missing file metadata isn't a reason to guess a
+            # new identity. ISBN-only associations still need the conflict guard.
+            if (not hardcover_id_raw and local_book is not None and local_book.hardcover_id
+                    and normalized(local_book.title) == normalized(title)
+                    and normalized(local_book.author) == normalized(author)):
+                hardcover_id_int = local_book.hardcover_id
+                hardcover_slug = local_book.hardcover_slug
+                try:
+                    hardcover_book_data = await resolve_work(hardcover_id_int, db)
+                    hardcover_id_int = int(hardcover_book_data["id"])
+                    hardcover_slug = hardcover_book_data.get("slug") or hardcover_slug
+                except Exception as lookup_error:
+                    logger.warning("known_hardcover_lookup_failed",
+                                   hardcover_id=hardcover_id_int,
+                                   error_type=type(lookup_error).__name__)
+                    # Keep catalogue metadata when its provider is unavailable.
+                    hardcover_book_data = {
+                        "description": local_book.description,
+                        "pages": local_book.page_count,
+                        "cached_image": {"url": local_book.cover_url},
+                        "release_date": local_book.published_date,
+                        "rating": local_book.rating,
+                        "ratings_count": local_book.ratings_count,
+                        "users_count": local_book.users_count,
+                        "book_series": [{"position": local_book.series_position,
+                                         "series": {"id": local_book.series_id,
+                                                    "name": local_book.series}}],
+                        "taggings": [{"tag": {"tag": local_book.genres}}] if local_book.genres else [],
+                    }
+
             # If still no hardcover identifier, try searching by title/author
             if not hardcover_id_int and not hardcover_slug:
                 try:
