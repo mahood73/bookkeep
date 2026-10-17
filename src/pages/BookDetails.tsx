@@ -16,6 +16,15 @@ import { toast } from 'sonner';
 import { useUser } from '@/contexts/UserContext';
 import { usePageVisibility } from '@/hooks/usePageVisibility';
 
+const requestStatusLabels = new Map([
+  ['pending', 'Pending approval'],
+  ['approved', 'Approved'],
+  ['processing', 'Processing'],
+  ['available', 'Available'],
+  ['not_found', 'Not found'],
+  ['denied', 'Denied'],
+]);
+
 export default function BookDetails() {
   const { id } = useParams();
   const [searchParams] = useSearchParams();
@@ -426,13 +435,16 @@ export default function BookDetails() {
                   </Button>
                 )}
 
-                {/* Processing indicator */}
-                {hasAnyRequests && !ebookAvailable && !audiobookAvailable && (
-                  <div className="inline-flex items-center gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-5 py-3 text-sm font-medium text-amber-400">
+                {/* Request states are separate from availability and download progress. */}
+                {[
+                  { format: 'eBook', status: ebookRequestStatus },
+                  { format: 'Audiobook', status: audiobookRequestStatus },
+                ].map(({ format, status }) => status && (
+                  <div key={format} className="inline-flex items-center gap-2 rounded-xl border border-border/50 bg-card/50 px-5 py-3 text-sm font-medium">
                     <Clock className="h-4 w-4" />
-                    Requested • Processing
+                    {format} request: {requestStatusLabels.get(status) ?? 'Unknown status'}
                   </div>
-                )}
+                ))}
                 {isAdmin && dbBook?.id && <>
                   <Button size="lg" variant="outline" onClick={() => setMatchOpen(true)}>Correct Hardcover match</Button>
                   <HardcoverMatchDialog bookId={dbBook.id} open={matchOpen} onOpenChange={setMatchOpen} onApplied={newId => {
