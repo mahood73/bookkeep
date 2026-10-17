@@ -3,13 +3,14 @@ APScheduler-based job scheduler for Book Hound.
 Handles all background tasks with proper scheduling, persistence, and dynamic updates.
 """
 import asyncio
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Dict, Any, Optional, Callable
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_ERROR, EVENT_JOB_MISSED
+from app.job_time import as_utc, serialize_utc, utc_now
 
 logger = structlog.get_logger(__name__)
 
@@ -44,6 +45,7 @@ JOB_DEFINITIONS = {
         "type": "PROCESS",
     },
     "sync_download_states": {
+        "manual": False,
         "default_interval": 2 * 60,  # 2 minutes
         "description": "Sync download states from download clients",
         "type": "PROCESS",
@@ -54,6 +56,15 @@ JOB_DEFINITIONS = {
         "type": "PROCESS",
     },
 }
+
+
+def get_job_function(job_name: str) -> Optional[Callable]:
+    """Resolve registered jobs lazily so scheduler and manual dispatch agree."""
+    if job_name not in JOB_DEFINITIONS:
+        return None
+    from app import tasks
+    function = getattr(tasks, job_name, None)
+    return function if callable(function) else None
 
 
 def get_scheduler() -> AsyncIOScheduler:
@@ -110,15 +121,15 @@ def update_job_in_db(job_name: str):
     try:
         schedule = db.query(JobSchedule).filter(JobSchedule.job_name == job_name).first()
         if schedule:
-            schedule.last_execution = datetime.now()
+            schedule.last_execution = utc_now()
             # Get next run time from scheduler
             sched = get_scheduler()
             job = sched.get_job(job_name)
             if job and job.next_run_time:
-                schedule.next_execution = job.next_run_time.replace(tzinfo=None)
+                schedule.next_execution = as_utc(job.next_run_time)
             else:
                 interval = schedule.interval_seconds or JOB_DEFINITIONS.get(job_name, {}).get("default_interval", 3600)
-                schedule.next_execution = datetime.now() + timedelta(seconds=interval)
+                schedule.next_execution = utc_now() + timedelta(seconds=interval)
             db.commit()
     except Exception as e:
         logger.warning("update_job_in_db_error", job_name=job_name, error=str(e))
@@ -136,7 +147,7 @@ def add_job(job_name: str, func: Callable, interval_seconds: int):
         sched.remove_job(job_name)
     
     # Add the job with interval trigger
-    trigger = IntervalTrigger(seconds=interval_seconds)
+    trigger = IntervalTrigger(seconds=interval_seconds, timezone='UTC')
     sched.add_job(
         func,
         trigger=trigger,
@@ -166,7 +177,7 @@ def update_next_execution_in_db(job_name: str):
     try:
         schedule = db.query(JobSchedule).filter(JobSchedule.job_name == job_name).first()
         if schedule and job.next_run_time:
-            schedule.next_execution = job.next_run_time.replace(tzinfo=None)
+            schedule.next_execution = as_utc(job.next_run_time)
             db.commit()
     except Exception as e:
         logger.warning("update_next_execution_error", job_name=job_name, error=str(e))
@@ -184,14 +195,14 @@ def reschedule_job(job_name: str, interval_seconds: int):
     job = sched.get_job(job_name)
     
     if job:
-        trigger = IntervalTrigger(seconds=interval_seconds)
+        trigger = IntervalTrigger(seconds=interval_seconds, timezone='UTC')
         sched.reschedule_job(job_name, trigger=trigger)
         
         # Get the new next_run_time from scheduler
         updated_job = sched.get_job(job_name)
         next_run = None
         if updated_job and updated_job.next_run_time:
-            next_run = updated_job.next_run_time.replace(tzinfo=None)
+            next_run = as_utc(updated_job.next_run_time)
         
         logger.info("job_rescheduled", 
                    job_name=job_name, 
@@ -231,9 +242,6 @@ def get_job_info(job_name: str) -> Optional[Dict[str, Any]]:
         return None
     
     next_run = job.next_run_time
-    if next_run:
-        # Convert to naive datetime
-        next_run = next_run.replace(tzinfo=None)
     
     # Get interval from trigger
     interval = None
@@ -242,7 +250,7 @@ def get_job_info(job_name: str) -> Optional[Dict[str, Any]]:
     
     return {
         "name": job_name,
-        "next_run_time": next_run.isoformat() if next_run else None,
+        "next_run_time": serialize_utc(next_run),
         "interval_seconds": interval,
     }
 
@@ -267,7 +275,7 @@ def run_job_now(job_name: str):
     
     if job:
         # Modify the job to run now
-        sched.modify_job(job_name, next_run_time=datetime.now())
+        sched.modify_job(job_name, next_run_time=utc_now())
         logger.info("job_triggered_now", job_name=job_name)
     else:
         logger.warning("job_not_found_for_run", job_name=job_name)
@@ -291,27 +299,6 @@ async def initialize_jobs():
     """Initialize all jobs from database or defaults"""
     from app.database import SessionLocal
     from app.models import JobSchedule
-    from app.tasks import (
-        refresh_seed_data,
-        check_processing_requests,
-        sync_from_booklore,
-        sync_from_audiobookshelf,
-        sync_missing_metadata,
-        sync_download_states,
-        sync_hardcover_lists,
-    )
-
-    # Map job names to their async functions
-    job_functions = {
-        "refresh_seed_data": refresh_seed_data,
-        "check_processing_requests": check_processing_requests,
-        "sync_from_booklore": sync_from_booklore,
-        "sync_from_audiobookshelf": sync_from_audiobookshelf,
-        "sync_missing_metadata": sync_missing_metadata,
-        "sync_download_states": sync_download_states,
-        "sync_hardcover_lists": sync_hardcover_lists,
-    }
-    
     db = SessionLocal()
     try:
         for job_name, definition in JOB_DEFINITIONS.items():
@@ -331,7 +318,7 @@ async def initialize_jobs():
                 db.add(schedule)
             
             # Add job to scheduler
-            func = job_functions.get(job_name)
+            func = get_job_function(job_name)
             if func:
                 add_job(job_name, func, interval)
                 logger.info("job_initialized", job_name=job_name, interval_seconds=interval)

@@ -8,6 +8,8 @@ import uuid
 
 from app import database, models
 from app.auth import require_admin
+from app.scheduler import JOB_DEFINITIONS, get_job_function
+from app.job_time import as_utc, serialize_utc, utc_now
 
 logger = structlog.get_logger()
 
@@ -20,12 +22,9 @@ _running_jobs: Dict[str, Dict[str, Any]] = {}
 
 # Default job configurations
 DEFAULT_JOBS = {
-    "refresh_seed_data": {"interval_seconds": 24 * 60 * 60, "type": "PROCESS"},
-    "check_processing_requests": {"interval_seconds": 5 * 60, "type": "PROCESS"},
-    "sync_from_booklore": {"interval_seconds": 24 * 60 * 60, "type": "PROCESS"},
-    "sync_from_audiobookshelf": {"interval_seconds": 24 * 60 * 60, "type": "PROCESS"},
-    "sync_missing_metadata": {"interval_seconds": 6 * 60 * 60, "type": "PROCESS"},
-    "sync_hardcover_lists": {"interval_seconds": 6 * 60 * 60, "type": "PROCESS"},
+    name: {"interval_seconds": definition["default_interval"], "type": definition["type"]}
+    for name, definition in JOB_DEFINITIONS.items()
+    if definition.get("manual", True)
 }
 
 # Available interval options (in seconds) for the dropdown
@@ -124,7 +123,7 @@ def get_job_info(job_name: str, db: Session) -> Dict[str, Any]:
     elif last_execution:
         next_execution = last_execution + timedelta(seconds=interval_seconds)
     elif interval_seconds > 0:
-        next_execution = datetime.now()
+        next_execution = utc_now()
     else:
         next_execution = None
     
@@ -132,8 +131,8 @@ def get_job_info(job_name: str, db: Session) -> Dict[str, Any]:
         "name": job_name,
         "type": DEFAULT_JOBS.get(job_name, {}).get("type", "PROCESS"),
         "interval_seconds": interval_seconds,
-        "last_execution": (last_execution.isoformat() + "Z") if last_execution else None,
-        "next_execution": (next_execution.isoformat() + "Z") if next_execution else None,
+        "last_execution": serialize_utc(last_execution),
+        "next_execution": serialize_utc(next_execution),
         "is_enabled": is_enabled,
         "state": state,  # Job-specific state (e.g., offset for seed data)
     }
@@ -143,7 +142,7 @@ def update_job_execution_time(job_name: str, db: Session):
     """Update the last execution time for a job"""
     schedule = get_job_schedule(job_name, db)
     if schedule:
-        schedule.last_execution = datetime.now()
+        schedule.last_execution = utc_now()
         db.add(schedule)
         db.commit()
 
@@ -247,22 +246,9 @@ async def run_job(
             detail=f"Job '{job_name}' not found"
         )
     
-    # Trigger the job via APScheduler
-    from app.scheduler import run_job_now
-    run_job_now(job_name)
-    
-    # Import job functions for the background task wrapper
-    from app.tasks import refresh_seed_data, check_processing_requests, sync_from_booklore, sync_from_audiobookshelf, sync_missing_metadata
-
-    job_functions = {
-        "refresh_seed_data": refresh_seed_data,
-        "check_processing_requests": check_processing_requests,
-        "sync_from_booklore": sync_from_booklore,
-        "sync_from_audiobookshelf": sync_from_audiobookshelf,
-        "sync_missing_metadata": sync_missing_metadata,
-    }
-    
-    job_func = job_functions.get(job_name)
+    # A manual run uses the tracked background task only. Rescheduling the
+    # periodic job as well would dispatch twice and alter its normal cadence.
+    job_func = get_job_function(job_name)
     if not job_func:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -271,7 +257,7 @@ async def run_job(
     
     # Generate a unique run ID
     run_id = str(uuid.uuid4())
-    started_at = datetime.now()
+    started_at = utc_now()
     
     # Track this job run
     _running_jobs[run_id] = {
@@ -287,11 +273,11 @@ async def run_job(
         try:
             await job_func()
             _running_jobs[run_id]["status"] = "completed"
-            _running_jobs[run_id]["completed_at"] = datetime.now()
+            _running_jobs[run_id]["completed_at"] = utc_now()
             logger.info("job_completed", job_name=job_name, run_id=run_id)
         except Exception as e:
             _running_jobs[run_id]["status"] = "failed"
-            _running_jobs[run_id]["completed_at"] = datetime.now()
+            _running_jobs[run_id]["completed_at"] = utc_now()
             _running_jobs[run_id]["error"] = str(e)
             logger.error("job_failed", job_name=job_name, run_id=run_id, error=str(e))
         finally:
@@ -321,7 +307,7 @@ async def run_job(
         "message": f"Job '{job_name}' has been triggered",
         "job_name": job_name,
         "run_id": run_id,
-        "triggered_at": started_at.isoformat()
+        "triggered_at": serialize_utc(started_at)
     }
 
 
@@ -342,15 +328,15 @@ async def get_job_status(
     # Calculate duration
     duration_seconds = None
     if job_run["started_at"]:
-        end_time = job_run["completed_at"] or datetime.now()
-        duration_seconds = (end_time - job_run["started_at"]).total_seconds()
+        end_time = job_run["completed_at"] or utc_now()
+        duration_seconds = (as_utc(end_time) - as_utc(job_run["started_at"])).total_seconds()
     
     return {
         "run_id": run_id,
         "job_name": job_run["job_name"],
         "status": job_run["status"],
-        "started_at": job_run["started_at"].isoformat() if job_run["started_at"] else None,
-        "completed_at": job_run["completed_at"].isoformat() if job_run["completed_at"] else None,
+        "started_at": serialize_utc(job_run["started_at"]),
+        "completed_at": serialize_utc(job_run["completed_at"]),
         "duration_seconds": duration_seconds,
         "error": job_run["error"],
     }
