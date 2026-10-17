@@ -26,7 +26,7 @@ def sessions():
     ('The Food of the Gods', 'H. G. Wells', 458307, 1836489, 'The Novels of H. G. Wells: Volume One', 2253),
     ('The Long Way to a Small, Angry Planet', 'Becky Chambers', 748620, 1976891, 'Becky Chambers 4 Book Set', 2261),
 ])
-def test_sync_keeps_existing_work_when_search_returns_collection(sessions, title, author, correct, wrong, collection, gid):
+def test_sync_uses_known_work_without_searching_for_a_collection(sessions, title, author, correct, wrong, collection, gid):
     with sessions() as db:
         db.add(Book(id=304, title=title, author=author, hardcover_id=correct,
                     hardcover_slug='correct-work', description='original description', page_count=198))
@@ -37,7 +37,7 @@ def test_sync_keeps_existing_work_when_search_returns_collection(sessions, title
                  'contributions': [{'author': {'name': author}}]}
     async def resolve(work_id, db):
         return {'id': int(work_id)}
-    with patch('app.hardcover_matching.resolve_work', side_effect=resolve), patch('app.tasks.SessionLocal', sessions), patch('app.routers.booklore.get_default_booklore_server', return_value=SimpleNamespace(name='library', ebook_library_id=None, audiobook_library_id=None)), patch('app.routers.booklore.get_booklore_books', AsyncMock(return_value=library)), patch('app.routers.hardcover.lookup_book_by_title_author', AsyncMock(return_value=candidate)), patch('app.tasks.asyncio.sleep', AsyncMock()):
+    with patch('app.hardcover_matching.resolve_work', side_effect=resolve), patch('app.tasks.SessionLocal', sessions), patch('app.routers.booklore.get_default_booklore_server', return_value=SimpleNamespace(name='library',url='https://fixture.invalid', ebook_library_id=None, audiobook_library_id=None)), patch('app.routers.booklore.get_booklore_books', AsyncMock(return_value=library)), patch('app.routers.hardcover.lookup_book_by_title_author', AsyncMock(return_value=candidate)), patch('app.tasks.asyncio.sleep', AsyncMock()):
         asyncio.run(sync_from_booklore())
     with sessions() as db:
         book = db.get(Book, 304)
@@ -48,7 +48,7 @@ def test_sync_keeps_existing_work_when_search_returns_collection(sessions, title
         assert book.booklore_id == gid
         assert book.ebook_available
         from app.models import HardcoverMatch
-        assert db.get(HardcoverMatch, book.id).pending_hardcover_id == wrong
+        assert db.get(HardcoverMatch, book.id) is None
 
 @pytest.mark.parametrize('hardcover_id,reviewed,candidate_id',[(None,False,1976891),(748620,True,1976891),(111,False,748620)])
 def test_local_only_reviewed_and_canonical_aliases_survive_sync(sessions,hardcover_id,reviewed,candidate_id):
@@ -60,7 +60,7 @@ def test_local_only_reviewed_and_canonical_aliases_survive_sync(sessions,hardcov
         db.commit()
     library=[{'id':1,'title':'A work','metadata':{'authors':['A Writer'],'isbn13':'file-isbn'}}]
     async def resolve(work_id,db):return {'id':748620}
-    with patch('app.hardcover_matching.resolve_work',side_effect=resolve),patch('app.tasks.SessionLocal',sessions),patch('app.routers.booklore.get_default_booklore_server',return_value=SimpleNamespace(name='library',ebook_library_id=None,audiobook_library_id=None)),patch('app.routers.booklore.get_booklore_books',AsyncMock(return_value=library)),patch('app.routers.hardcover.lookup_book_by_title_author',AsyncMock(return_value={'id':candidate_id,'title':'Collection','slug':'candidate'})),patch('app.tasks.asyncio.sleep',AsyncMock()):
+    with patch('app.hardcover_matching.resolve_work',side_effect=resolve),patch('app.tasks.SessionLocal',sessions),patch('app.routers.booklore.get_default_booklore_server',return_value=SimpleNamespace(name='library',url='https://fixture.invalid',ebook_library_id=None,audiobook_library_id=None)),patch('app.routers.booklore.get_booklore_books',AsyncMock(return_value=library)),patch('app.routers.hardcover.lookup_book_by_title_author',AsyncMock(return_value={'id':candidate_id,'title':'Collection','slug':'candidate'})),patch('app.tasks.asyncio.sleep',AsyncMock()):
         asyncio.run(sync_from_booklore())
     with sessions() as db:
         book=db.get(Book,304)
@@ -73,7 +73,7 @@ def test_isbn_match_cannot_reassign_an_existing_work(sessions):
         db.commit()
     library=[{'id':1,'title':'Different collection','metadata':{'authors':['A Writer'],'isbn13':'same-isbn'}}]
     async def resolve(work_id,db):return {'id':work_id}
-    with patch('app.hardcover_matching.resolve_work',side_effect=resolve),patch('app.tasks.SessionLocal',sessions),patch('app.routers.booklore.get_default_booklore_server',return_value=SimpleNamespace(name='library',ebook_library_id=None,audiobook_library_id=None)),patch('app.routers.booklore.get_booklore_books',AsyncMock(return_value=library)),patch('app.routers.hardcover.lookup_book_by_title_author',AsyncMock(return_value={'id':456,'title':'Different collection'})),patch('app.tasks.asyncio.sleep',AsyncMock()):
+    with patch('app.hardcover_matching.resolve_work',side_effect=resolve),patch('app.tasks.SessionLocal',sessions),patch('app.routers.booklore.get_default_booklore_server',return_value=SimpleNamespace(name='library',url='https://fixture.invalid',ebook_library_id=None,audiobook_library_id=None)),patch('app.routers.booklore.get_booklore_books',AsyncMock(return_value=library)),patch('app.routers.hardcover.lookup_book_by_title_author',AsyncMock(return_value={'id':456,'title':'Different collection'})),patch('app.tasks.asyncio.sleep',AsyncMock()):
         asyncio.run(sync_from_booklore())
     with sessions() as db:
         book=db.get(Book,304)
@@ -83,7 +83,7 @@ def test_isbn_match_cannot_reassign_an_existing_work(sessions):
 def test_new_uncertain_collection_goes_to_review_without_identity(sessions):
     library=[{'id':1,'title':'A single story','metadata':{'authors':['A Writer']}}]
     candidate={'id':456,'title':'A Writer Complete Works','compilation':False}
-    with patch('app.hardcover_matching.resolve_work',AsyncMock(return_value=candidate)),patch('app.hardcover_matching.canonical_family',AsyncMock(return_value={456})),patch('app.tasks.SessionLocal',sessions),patch('app.routers.booklore.get_default_booklore_server',return_value=SimpleNamespace(name='library',ebook_library_id=None,audiobook_library_id=None)),patch('app.routers.booklore.get_booklore_books',AsyncMock(return_value=library)),patch('app.routers.hardcover.lookup_book_by_title_author',AsyncMock(return_value=candidate)),patch('app.tasks.asyncio.sleep',AsyncMock()):
+    with patch('app.hardcover_matching.resolve_work',AsyncMock(return_value=candidate)),patch('app.hardcover_matching.canonical_family',AsyncMock(return_value={456})),patch('app.tasks.SessionLocal',sessions),patch('app.routers.booklore.get_default_booklore_server',return_value=SimpleNamespace(name='library',url='https://fixture.invalid',ebook_library_id=None,audiobook_library_id=None)),patch('app.routers.booklore.get_booklore_books',AsyncMock(return_value=library)),patch('app.routers.hardcover.lookup_book_by_title_author',AsyncMock(return_value=candidate)),patch('app.tasks.asyncio.sleep',AsyncMock()):
         asyncio.run(sync_from_booklore())
     with sessions() as db:
         book=db.query(Book).one()
@@ -97,7 +97,7 @@ def test_existing_library_link_keeps_reviewed_match_without_lookup(sessions):
         db.add(Book(id=304,title='A work',author='A Writer',hardcover_id=123,booklore_id=1))
         db.commit()
     lookup=AsyncMock()
-    with patch('app.tasks.SessionLocal',sessions),patch('app.routers.booklore.get_default_booklore_server',return_value=SimpleNamespace(name='library',ebook_library_id=None,audiobook_library_id=None)),patch('app.routers.booklore.get_booklore_books',AsyncMock(return_value=[{'id':1,'title':'A work','metadata':{'hardcoverId':'different-slug'}}])),patch('app.routers.hardcover.lookup_book_by_title_author',lookup):
+    with patch('app.tasks.SessionLocal',sessions),patch('app.routers.booklore.get_default_booklore_server',return_value=SimpleNamespace(name='library',url='https://fixture.invalid',ebook_library_id=None,audiobook_library_id=None)),patch('app.routers.booklore.get_booklore_books',AsyncMock(return_value=[{'id':1,'title':'A work','metadata':{'hardcoverId':'different-slug'}}])),patch('app.routers.hardcover.lookup_book_by_title_author',lookup):
         asyncio.run(sync_from_booklore())
     lookup.assert_not_called()
     with sessions() as db:assert db.get(Book,304).hardcover_id==123
@@ -114,7 +114,7 @@ def test_verified_canonical_family_reuses_existing_row_and_allows_real_collectio
             db.commit()
     # Different spelling bypasses the literal title match; canonical family must find the row.
     library = [{'id': 1, 'title': 'Collected Stories!', 'metadata': {'authors': ['A Writer']}}]
-    with patch('app.hardcover_matching.resolve_work', AsyncMock(return_value=canonical)), patch('app.hardcover_matching.canonical_family', AsyncMock(return_value={111, 222})), patch('app.tasks.SessionLocal', sessions), patch('app.routers.booklore.get_default_booklore_server', return_value=SimpleNamespace(name='library', ebook_library_id=None, audiobook_library_id=None)), patch('app.routers.booklore.get_booklore_books', AsyncMock(return_value=library)), patch('app.routers.hardcover.lookup_book_by_title_author', AsyncMock(return_value=candidate)), patch('app.tasks.asyncio.sleep', AsyncMock()):
+    with patch('app.hardcover_matching.resolve_work', AsyncMock(return_value=canonical)), patch('app.hardcover_matching.canonical_family', AsyncMock(return_value={111, 222})), patch('app.tasks.SessionLocal', sessions), patch('app.routers.booklore.get_default_booklore_server', return_value=SimpleNamespace(name='library',url='https://fixture.invalid', ebook_library_id=None, audiobook_library_id=None)), patch('app.routers.booklore.get_booklore_books', AsyncMock(return_value=library)), patch('app.routers.hardcover.lookup_book_by_title_author', AsyncMock(return_value=candidate)), patch('app.tasks.asyncio.sleep', AsyncMock()):
         asyncio.run(sync_from_booklore())
     with sessions() as db:
         book = db.query(Book).one()
@@ -134,7 +134,7 @@ def test_slug_fallback_cannot_replace_an_unrelated_identity(sessions):
     async def resolve(work_id, db):
         return candidate if int(work_id) == 456 else {'id': 123}
     library = [{'id': 1, 'title': 'Different work', 'metadata': {'authors': ['A Writer']}}]
-    with patch('app.hardcover_matching.resolve_work', side_effect=resolve), patch('app.hardcover_matching.canonical_family', AsyncMock(return_value={456})), patch('app.tasks.SessionLocal', sessions), patch('app.routers.booklore.get_default_booklore_server', return_value=SimpleNamespace(name='library', ebook_library_id=None, audiobook_library_id=None)), patch('app.routers.booklore.get_booklore_books', AsyncMock(return_value=library)), patch('app.routers.hardcover.lookup_book_by_title_author', AsyncMock(return_value=candidate)), patch('app.tasks.asyncio.sleep', AsyncMock()):
+    with patch('app.hardcover_matching.resolve_work', side_effect=resolve), patch('app.hardcover_matching.canonical_family', AsyncMock(return_value={456})), patch('app.tasks.SessionLocal', sessions), patch('app.routers.booklore.get_default_booklore_server', return_value=SimpleNamespace(name='library',url='https://fixture.invalid', ebook_library_id=None, audiobook_library_id=None)), patch('app.routers.booklore.get_booklore_books', AsyncMock(return_value=library)), patch('app.routers.hardcover.lookup_book_by_title_author', AsyncMock(return_value=candidate)), patch('app.tasks.asyncio.sleep', AsyncMock()):
         asyncio.run(sync_from_booklore())
     with sessions() as db:
         book = db.get(Book, 304)
