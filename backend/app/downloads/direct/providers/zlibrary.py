@@ -1,7 +1,7 @@
 """Z-Library's JSON API, pinned to the configured HTTPS domain."""
 import re
 from typing import List, Optional
-from urllib.parse import urlsplit, urljoin
+from urllib.parse import urlsplit, urljoin, urlunsplit, unquote
 
 import httpx
 import structlog
@@ -158,7 +158,7 @@ class ZLibraryProvider(DirectProvider):
                 language = {"english": "en", "french": "fr", "german": "de", "spanish": "es", "italian": "it", "portuguese": "pt", "russian": "ru"}.get(language, language) or None
                 year_text = str(book.get("year") or "")
                 results.append(DirectSearchResult(
-                    title=book_title, download_url=url, info_url=url,
+                    title=book_title, download_url=url, info_url=self._browser_book_url(book.get("href")),
                     format=ext, size_bytes=size, author=book.get("author"), language=language,
                     year=int(year_text) if year_text.isdigit() else None,
                     quality_score=self._calculate_quality(ext, size, format_type), provider=self.name,
@@ -170,6 +170,24 @@ class ZLibraryProvider(DirectProvider):
                 raise SearchError(f"Z-Library search failed: {self.last_error}. Retry manually.") from None
             logger.warning("zlibrary_search_failed", domain=self.domain, error=self.last_error)
             return []
+
+    def _browser_book_url(self, href) -> Optional[str]:
+        """Use the provider's browser route without exposing session parameters."""
+        if not isinstance(href, str) or not href.strip():
+            return None
+        href = href.strip()
+        if any(character.isspace() or character == "\\" for character in href):
+            return None
+        try:
+            parsed = urlsplit(urljoin(self.base_url + "/", href))
+            parts = unquote(parsed.path).split("/")
+            if (parsed.scheme != "https" or parsed.netloc.lower() != self.domain or
+                    parts[:2] != ["", "book"] or len(parts) < 4 or
+                    not parts[2] or not parts[3] or any(part in (".", "..") for part in parts)):
+                return None
+            return urlunsplit(("https", self.domain, parsed.path, "", ""))
+        except ValueError:
+            return None
 
     def is_book_url(self, url: str) -> bool:
         parsed = urlsplit(url)
