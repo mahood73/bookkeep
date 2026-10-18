@@ -33,6 +33,73 @@ def login_response():
     return httpx.Response(200, json={"success": 1, "user": {"id": 42, "remix_userkey": "test-session-key", "personalDomains": ["ignored.example"]}})
 
 
+def test_search_keeps_provider_browser_href_separate_from_download_reference():
+    # Synthetic API fixture uses the observed URL forms; it does not assert
+    # that the user's numeric reference and browser URL identify one edition.
+    browser_path = "/book/orQkJ1wGAG/three-bags-full-a-sheep-detective-story-1.html"
+    def respond(request):
+        if request.url.path.endswith("/login"):
+            return login_response()
+        return httpx.Response(200, json={"success": 1, "books": [{
+            "id": 1045820, "hash": "51bd13", "title": "Three Bags Full",
+            "author": "Leonie Swann", "extension": "epub", "href": browser_path,
+        }]})
+    async def run():
+        provider = provider_with_transport(respond)
+        try:
+            result, = await provider.search("Three Bags Full", "Leonie Swann")
+            assert result.info_url == "https://z-lib.gd" + browser_path
+            assert result.download_url == "https://z-lib.gd/book/1045820/51bd13"
+        finally:
+            await provider.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("href,expected_path", [
+    ("/book/publicToken/station-eleven.html", "/book/publicToken/station-eleven.html"),
+    ("book/publicToken/station-eleven.html", "/book/publicToken/station-eleven.html"),
+    ("https://override.example/book/publicToken/station-eleven.html", "/book/publicToken/station-eleven.html"),
+    ("//override.example/book/publicToken/station-eleven.html", "/book/publicToken/station-eleven.html"),
+    ("/book/123/abc123/station-eleven.html", "/book/123/abc123/station-eleven.html"),
+    ("/book/publicToken/station-eleven.html?remix_userkey=private&remix_userid=42#session", "/book/publicToken/station-eleven.html"),
+    (None, None), ("", None), ({"href": "/book/token/title.html"}, None),
+    ("https://override.example/", None), ("/s/station-eleven", None),
+    ("javascript:alert(1)", None), ("http://override.example/book/token/title.html", None),
+    ("https://other.example/book/token/title.html", None),
+    ("//other.example/book/token/title.html", None),
+    ("https://user:password@override.example/book/token/title.html", None),
+    ("https://override.example:443/book/token/title.html", None),
+    ("/book/token", None), ("/book//title.html", None),
+    ("/book/token/../title.html", None), ("/book/token/%2e%2e/title.html", None),
+    ("/book/token/title.html\njunk", None), ("/book/token\\title.html", None),
+])
+def test_browser_link_validation_does_not_change_api_download_resolution(href, expected_path):
+    seen = []
+    def respond(request):
+        seen.append(request.url.path)
+        if request.url.path.endswith("/login"):
+            return login_response()
+        if request.url.path.endswith("/search"):
+            return httpx.Response(200, json={"success": 1, "books": [{
+                "id": 123, "hash": "abc123", "title": "Station Eleven",
+                "extension": "epub", "href": href,
+            }]})
+        assert request.url.path == "/eapi/book/123/abc123/file"
+        return httpx.Response(200, json={"success": 1, "file": {"downloadLink": "/dl/book.epub"}})
+    async def run():
+        provider = provider_with_transport(respond, "override.example")
+        try:
+            result, = await provider.search("Station Eleven")
+            expected = "https://override.example" + expected_path if expected_path else None
+            assert result.info_url == expected
+            assert result.download_url == "https://override.example/book/123/abc123"
+            assert await provider.resolve_download_url(result.download_url) == "https://override.example/dl/book.epub"
+        finally:
+            await provider.close()
+    asyncio.run(run())
+    assert seen == ["/eapi/user/login", "/eapi/book/search", "/eapi/book/123/abc123/file"]
+
+
 def test_override_applies_to_login_search_and_resolution():
     seen = []
     def respond(request):
