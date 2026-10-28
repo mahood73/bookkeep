@@ -381,6 +381,102 @@ async def start_download(
         )
 
 
+@router.post("/tasks/{task_id}/retry", response_model=DownloadResponse)
+async def retry_download(
+    task_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Retry a stored release; retain the failure until a replacement starts."""
+    from dataclasses import fields
+    from datetime import datetime
+    from sqlalchemy import text
+    from ..downloads import Release
+    from ..downloads.orchestrator import ACTIVE_STATES, FULFILLED_STATES
+
+    original = db.get(DownloadTask, task_id)
+    if not original:
+        raise HTTPException(status_code=404, detail="Download task not found")
+
+    try:
+        # Use the same per-book lock as task creation, including on SQLite.
+        db.execute(text("UPDATE books SET id = id WHERE id = :id"), {"id": original.book_id})
+        db.expire_all()
+        original = db.get(DownloadTask, task_id)
+        if not original:
+            raise HTTPException(status_code=404, detail="Download task not found")
+        if original.state != "error":
+            raise HTTPException(status_code=409, detail="Only failed downloads can be retried")
+        if original.import_status == "failed" and original.download_path:
+            raise HTTPException(status_code=409, detail="Downloaded files are retained; use Retry import.")
+        if original.format not in ("ebook", "audiobook") or original.protocol not in ("torrent", "usenet", "direct"):
+            raise HTTPException(status_code=400, detail="Stored download format or protocol is invalid; select a release again.")
+        if not original.download_url or not original.download_url.strip():
+            raise HTTPException(status_code=400, detail="Stored download URL is missing; select a release again.")
+        book = db.get(Book, original.book_id)
+        if not book:
+            raise HTTPException(status_code=404, detail="Book not found")
+        if getattr(book, f"{original.format}_available"):
+            raise HTTPException(status_code=409, detail="This format is already available in the library.")
+        existing = db.query(DownloadTask).filter(
+            DownloadTask.book_id == original.book_id, DownloadTask.format == original.format,
+            DownloadTask.state.in_(ACTIVE_STATES + FULFILLED_STATES),
+        ).first()
+        if existing:
+            raise HTTPException(status_code=409, detail="A download for this book and format is already active or complete.")
+        if not get_download_path(db, original.format):
+            raise HTTPException(status_code=400, detail=f"Download path not configured for {original.format}.")
+
+        try:
+            stored = json.loads(original.release_data_json or "{}")
+            if not isinstance(stored, dict):
+                raise ValueError()
+            release_data = {f.name: stored[f.name] for f in fields(Release) if f.name in stored}
+            release_data.update(
+                source=original.source, title=original.release_title or stored.get("title") or "download",
+                download_url=original.download_url, protocol=original.protocol,
+                indexer=original.indexer or stored.get("indexer"),
+                size_bytes=original.size_bytes if original.size_bytes is not None else stored.get("size_bytes") or 0,
+            )
+            selection = DownloadRequest(
+                book_id=original.book_id, format_type=original.format,
+                download_url=release_data["download_url"], protocol=release_data["protocol"],
+                release_title=release_data["title"], indexer=release_data["indexer"] or original.source,
+                size_bytes=release_data["size_bytes"],
+            )
+            if selection.size_bytes < 0 or not isinstance(release_data.get("metadata", {}), dict):
+                raise ValueError()
+            release_data["size_bytes"] = selection.size_bytes
+            if release_data.get("publish_date"):
+                release_data["publish_date"] = datetime.fromisoformat(release_data["publish_date"])
+            release = Release(**release_data)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="Stored release data is invalid; select a release again.") from None
+
+        orchestrator = DownloadOrchestrator(db_session=db)
+        replacement = orchestrator.create_download_task(book, release, original.format, automatic=True)
+        if not replacement or not orchestrator.start_download(replacement.id):
+            raise HTTPException(status_code=502, detail="Download could not start. The original failed task has been retained.")
+
+        # The replacement is durable before removing the old failure. A later
+        # transfer failure remains visible on the replacement rather than vanishing.
+        db.query(models.BookRequest).filter(
+            models.BookRequest.book_id == original.book_id,
+            models.BookRequest.format == original.format,
+            models.BookRequest.status.in_(("approved", "not_found")),
+        ).update({models.BookRequest.status: "processing"}, synchronize_session=False)
+        db.delete(original)
+        db.commit()
+        return DownloadResponse(task_id=replacement.id, status="downloading", message="Download retry started")
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        logger.error("download_retry_failed", task_id=task_id, error_type=type(exc).__name__)
+        raise HTTPException(status_code=500, detail="Retry failed. Refresh Downloads before trying again.") from None
+
+
 @router.post("/auto-download/{book_id}", response_model=DownloadResponse)
 async def auto_download(
     book_id: int,
@@ -556,10 +652,12 @@ async def import_download(
         raise HTTPException(status_code=404, detail="Download task not found")
 
     # Check if task is in a state that can be imported
-    if task.state not in ["complete", "seeding"]:
+    if task.state not in ["complete", "seeding"] and not (
+        task.state == "error" and task.import_status == "failed" and task.download_path
+    ):
         raise HTTPException(
             status_code=400,
-            detail=f"Cannot import task in state '{task.state}'. Task must be complete or seeding."
+            detail=f"Cannot import task in state '{task.state}'. Task must be complete, seeding, or have a failed import with retained files."
         )
 
     # Check if we have a download path
@@ -582,6 +680,8 @@ async def import_download(
         if dest_path:
             # Update task with new destination path
             task.download_path = dest_path
+            task.state = "complete" if task.state == "error" else task.state
+            task.progress = 100.0
 
             # Add release hash to book's tracking system
             release_hash = compute_release_hash(task.download_url)
@@ -623,6 +723,8 @@ async def import_download(
                 detail="Import failed. Check server logs for details."
             )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("manual_import_error", task_id=task_id, error=str(e))
         raise HTTPException(
