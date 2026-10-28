@@ -1,4 +1,3 @@
-Not privileged to set domain environment.
 """
 Download orchestrator.
 
