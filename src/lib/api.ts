@@ -1,3 +1,5 @@
+import { apiErrorMessage } from './api-errors';
+
 // Use relative paths when served from same origin
 const API_BASE_URL = import.meta.env.VITE_API_URL || (import.meta.env.PROD ? '' : 'http://localhost:8000');
 
@@ -145,8 +147,8 @@ async function apiRequest<T>(
   }
 
   if (!response.ok) {
-    const error = await response.json().catch(() => ({ message: 'Request failed' }));
-    throw new Error(error.detail || error.message || `API request failed: ${response.status}`);
+    const error: unknown = await response.json().catch(() => null);
+    throw new Error(apiErrorMessage(error, response.status));
   }
 
   // Handle 204 No Content and other empty responses
@@ -1059,13 +1061,17 @@ export const downloadsApi = {
     download_url: string;
     protocol: string;
     release_title: string;
-    indexer?: string;
-    size_bytes?: number;
+    indexer: string;
+    size_bytes: number;
   }) =>
     apiRequest<DownloadResponse>('/api/downloads/download', {
       method: 'POST',
       body: JSON.stringify(request),
     }),
+
+  // Retry the server-stored release without reconstructing or deleting it in the browser.
+  retryTask: (taskId: number) =>
+    apiRequest<DownloadResponse>(`/api/downloads/tasks/${taskId}/retry`, { method: 'POST' }),
 
   // Automatically download the best release
   autoDownload: (bookId: number, formatType: 'ebook' | 'audiobook') =>

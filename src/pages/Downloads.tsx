@@ -22,6 +22,7 @@ import {
 import { toast } from 'sonner';
 import { useQuery, useQueryClient, useMutation } from '@tanstack/react-query';
 import { downloadsApi } from '@/lib/api';
+import { canRetryImport } from '@/lib/download-actions';
 import { DownloadLogPanel } from '@/components/downloads/DownloadLogPanel';
 
 interface DownloadTask {
@@ -252,24 +253,13 @@ export default function Downloads() {
 
   // Retry a failed download mutation
   const retryMutation = useMutation({
-    mutationFn: async (task: DownloadTask) => {
-      // Delete the old error task first so it doesn't clog the list
-      await downloadsApi.deleteTask(task.id);
-      // Re-queue the exact same download
-      return downloadsApi.downloadRelease({
-        book_id: task.book_id,
-        format_type: task.format,
-        download_url: task.download_url,
-        protocol: task.protocol,
-        release_title: task.release_title,
-        indexer: task.source || undefined,
-      });
-    },
+    mutationFn: (task: DownloadTask) => downloadsApi.retryTask(task.id),
     onSuccess: (data) => {
       toast.success('Download retrying', { description: data.message });
       queryClient.invalidateQueries({ queryKey: ['download-tasks'] });
     },
     onError: (err: Error) => {
+      queryClient.invalidateQueries({ queryKey: ['download-tasks'] });
       toast.error('Retry failed', { description: err.message });
     },
   });
@@ -651,7 +641,7 @@ export default function Downloads() {
                         {/* Show log button for direct downloads */}
                         <DownloadLogPanel taskId={task.id} protocol={task.protocol} />
                         {/* Retry button for failed downloads */}
-                        {task.state === 'error' && (
+                        {task.state === 'error' && !canRetryImport(task) && (
                           <TooltipProvider>
                             <Tooltip>
                               <TooltipTrigger asChild>
@@ -676,12 +666,11 @@ export default function Downloads() {
                           </TooltipProvider>
                         )}
                         {/* Show import button when:
-                            1. Download is complete/seeding
+                            1. Download is complete/seeding, or staging failed with retained files
                             2. Import hasn't succeeded
                             3. Either not importing, OR importing but appears stuck (no recent update)
                         */}
-                        {(task.state === 'complete' || task.state === 'seeding') &&
-                         task.import_status !== 'imported' && (
+                        {canRetryImport(task) && (
                           <Button
                             size="sm"
                             variant="outline"
