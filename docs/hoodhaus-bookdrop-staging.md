@@ -1,4 +1,3 @@
-Not privileged to set domain environment.
 # Bookdrop staging and consumer cleanup
 
 Related tracking: [HoodHaus issue #57](https://gitlab.com/mahood73/hoodhaus/-/issues/57).
