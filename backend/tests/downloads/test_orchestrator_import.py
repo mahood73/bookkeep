@@ -1,4 +1,3 @@
-Not privileged to set domain environment.
 """Import regressions using real temporary files and a disposable SQLite database."""
 from threading import Event
 import errno
