@@ -5,6 +5,7 @@ Manages the complete download workflow from search to completion.
 """
 import os
 import shutil
+import stat
 import threading
 import unicodedata
 from pathlib import Path
@@ -597,68 +598,36 @@ class DownloadOrchestrator:
                 ).first()
                 use_hardlinks = not (global_setting and global_setting.value == "false")
 
-            if use_hardlinks:
-                # Try to hardlink first (fast, no extra space), fall back to copy
-                try:
-                    if source.is_file():
-                        os.link(str(source), str(dest_path))
+            def stage_file(src, dst):
+                if use_hardlinks:
+                    try:
+                        os.link(src, dst)
+                        return dst
+                    except OSError as error:
                         logger.info(
-                            "orchestrator_hardlink_success",
+                            "orchestrator_hardlink_failed_copying",
                             task_id=task.id,
-                            source=str(source),
-                            dest=str(dest_path)
+                            error=str(error),
                         )
-                    else:
-                        shutil.copytree(str(source), str(dest_path), copy_function=os.link)
-                        logger.info(
-                            "orchestrator_hardlink_dir_success",
-                            task_id=task.id,
-                            source=str(source),
-                            dest=str(dest_path)
-                        )
-                except (OSError, PermissionError) as e:
-                    # Hardlink failed (maybe cross-device), fall back to copy
-                    logger.info(
-                        "orchestrator_hardlink_failed_copying",
-                        task_id=task.id,
-                        error=str(e),
-                        message="Hardlink failed, falling back to copy"
-                    )
+                return shutil.copy2(src, dst)
 
-                    if source.is_file():
-                        shutil.copy2(str(source), str(dest_path))
-                        logger.info(
-                            "orchestrator_copy_success",
-                            task_id=task.id,
-                            source=str(source),
-                            dest=str(dest_path)
-                        )
-                    else:
-                        shutil.copytree(str(source), str(dest_path))
-                        logger.info(
-                            "orchestrator_copy_dir_success",
-                            task_id=task.id,
-                            source=str(source),
-                            dest=str(dest_path)
-                        )
+            if source.is_file():
+                stage_file(str(source), str(dest_path))
             else:
-                # Hardlinks disabled, copy directly
-                if source.is_file():
-                    shutil.copy2(str(source), str(dest_path))
-                    logger.info(
-                        "orchestrator_copy_success",
-                        task_id=task.id,
-                        source=str(source),
-                        dest=str(dest_path)
-                    )
-                else:
-                    shutil.copytree(str(source), str(dest_path))
-                    logger.info(
-                        "orchestrator_copy_dir_success",
-                        task_id=task.id,
-                        source=str(source),
-                        dest=str(dest_path)
-                    )
+                # Fall back per file: restarting copytree after a failed link
+                # would collide with the partially created destination tree.
+                shutil.copytree(str(source), str(dest_path), copy_function=stage_file)
+                # copytree preserves source directory modes, including 0555.
+                # Only new destination directories gain owner access. Never
+                # chmod files: a hardlink shares its metadata with the source.
+                for directory, _, _ in os.walk(dest_path):
+                    mode = stat.S_IMODE(os.stat(directory).st_mode)
+                    os.chmod(directory, mode | stat.S_IRWXU)
+            logger.info(
+                "orchestrator_staging_success",
+                task_id=task.id,
+                dest_path=str(dest_path),
+            )
 
             # Mark import as successful
             task.import_status = 'imported'
